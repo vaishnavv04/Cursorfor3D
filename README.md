@@ -3,6 +3,15 @@ CursorFor3D
 
 CursorFor3D is an experimental desktop workflow that connects an Electron + React UI, a Node.js backend, Google Gemini, and the Blender MCP (Model Context Protocol) add-on. The goal is to let artists describe a scene in natural language, optionally include a reference image, and have the AI build the corresponding 3D model directly inside Blender.
 
+## 🎯 Features
+
+- **Continuous Chat Interface**: Have back-and-forth conversations to refine your 3D models iteratively
+- **Grok-like Dark UI**: Sleek, modern dark-themed interface for a premium user experience
+- **Enhanced LLM Accuracy**: Improved prompts and context awareness for better model generation
+- **Prompt Enhancement**: Automatically enhances user prompts for more detailed and accurate results
+- **Conversation History**: Maintains context across multiple interactions
+- **Scene Context Awareness**: Tracks current Blender scene state for intelligent modifications
+
 Project Structure
 -----------------
 
@@ -16,7 +25,7 @@ CursorFor3D/
 Prerequisites
 -------------
 
-- Blender 4.2+ with the MCP add-on enabled on port 9876
+- Blender 4.5+ with the MCP add-on enabled on port 9876
 - Node.js 20+
 - A Google Gemini API key (Gemini 2.5 Flash or newer)
 - (Optional) A Groq API key if you want automatic fallback when Gemini rate limits
@@ -65,15 +74,16 @@ npm install
 Usage
 -----
 
-1. Open the Electron window.
-2. Type a scene description in the text prompt and optionally attach an image for extra context.
-3. Submit the request. The UI shows the raw Python code returned from Gemini and relays it to Blender MCP.
-4. Inspect Blender to watch the script execute.
+1. Open the Electron window or navigate to the generator page in your browser.
+2. Start a conversation by describing what you want to create.
+3. Refine your model through continuous chat - ask for modifications, improvements, or changes.
+4. Enable prompt enhancement for more detailed and accurate results.
+5. Watch your 3D scene come to life in Blender as you iterate!
 
 Troubleshooting
 ---------------
 
-- **No response from Blender**: check the backend console for messages such as “Blender MCP not connected”. Make sure the MCP panel is running on port 9876.
+- **No response from Blender**: check the backend console for messages such as "Blender MCP not connected". Make sure the MCP panel is running on port 9876.
 - **Gemini errors**: verify your `GEMINI_API_KEY` and the model name in `backend/server.js`.
 - **Electron window blank**: wait for the React dev server to finish compiling or restart with `npm run dev`.
 
@@ -83,3 +93,6 @@ Roadmap Ideas
 - Parse MCP responses to display build status in the UI
 - Offer curated script templates for common primitives
 - Add persistence for successful generations
+- Conversation history persistence
+- Multi-user support
+- Advanced prompt templates
