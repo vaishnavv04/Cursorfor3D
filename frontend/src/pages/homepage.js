@@ -2,9 +2,11 @@ import React from 'react';
 import Navbar from '../components/navbar';
 import { useNavigate } from 'react-router-dom';
 import { ArrowRight } from 'lucide-react';
+import { useAuth } from '../context/AuthContext';
 
 export default function HomePage() {
   const navigate = useNavigate();
+  const { token } = useAuth();
 
   return (
     <div className="bg-black text-white min-h-screen flex flex-col overflow-y-auto">
@@ -16,14 +18,14 @@ export default function HomePage() {
           Craft <span className="text-blue-400">Immersive Worlds</span> in Blender
         </h1>
         <button
-          onClick={() => navigate('/generate')}
+          onClick={() => navigate(token ? '/generate' : '/auth')}
           className="mt-8 bg-blue-600 px-6 py-3 rounded-full hover:bg-blue-700 transition"
         >
-          Craft in 3D →
+          {token ? 'Return to workspace →' : 'Craft in 3D →'}
         </button>
 
         <div
-          onClick={() => navigate('/generate')}
+          onClick={() => navigate(token ? '/generate' : '/auth')}
           className="mt-10 bg-gray-900 p-6 rounded-lg w-2/3 text-left flex items-center justify-between cursor-pointer hover:bg-gray-800 transition"
         >
           <p className="text-gray-400 text-lg">💡 Turn words into worlds</p>
