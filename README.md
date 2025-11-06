@@ -6,7 +6,7 @@ CursorFor3D is an experimental desktop workflow that connects an Electron + Reac
 ## 🎯 Features
 
 - **Continuous Chat Interface**: Have back-and-forth conversations to refine your 3D models iteratively
-- **Grok-like Dark UI**: Sleek, modern dark-themed interface for a premium user experience
+- **Dark UI**: Sleek, modern dark-themed interface for a premium user experience
 - **Enhanced LLM Accuracy**: Improved prompts and context awareness for better model generation
 - **Prompt Enhancement**: Automatically enhances user prompts for more detailed and accurate results
 - **Conversation History**: Maintains context across multiple interactions
@@ -30,16 +30,29 @@ Prerequisites
 - A Google Gemini API key (Gemini 2.5 Flash or newer)
 - (Optional) A Groq API key if you want automatic fallback when Gemini rate limits
 - (Optional) Python virtual environment for the MCP add-on if you tweak it locally
+- PostgreSQL database (or hosted equivalent like Supabase) for auth and chat persistence
 
 1. Configure Environment
 ------------------------
 
-1. In `backend/`, copy `.env.example` to `.env` (create the example file if needed) and set:
+1. In `backend/`, create a `.env` file (or copy from `.env.example` if present) and set:
 	```
+		# Required for auth and persistence
+		JWT_SECRET=replace_with_strong_random_string
+		DATABASE_URL=postgres://user:password@host:5432/dbname
+
+		# LLM providers
 		GEMINI_API_KEY=your_gemini_key
 		GROQ_API_KEY=your_groq_key # optional fallback provider
+
+		# Server ports
+		PORT=5000                    # backend HTTP port
+		BLENDER_TCP_HOST=127.0.0.1   # where Blender MCP listens
+		BLENDER_TCP_PORT=9876        # Blender MCP TCP port
+
 	```
 2. Launch Blender, enable the MCP panel, and start the server so it listens on TCP port 9876.
+3. Ensure your PostgreSQL instance is reachable from the backend. Supabase works out-of-the-box; SSL is auto-enabled when `DATABASE_URL` contains "supabase".
 
 2. Install Dependencies
 -----------------------
@@ -62,7 +75,7 @@ npm install
 	cd backend
 	npm start
 	```
-	The server listens on `http://localhost:5000` and maintains a TCP connection to Blender MCP.
+	The server listens on `http://localhost:5000` (configurable via `PORT`) and maintains a TCP connection to Blender MCP.
 
 2. **Frontend + Electron shell**
 	```powershell
@@ -86,6 +99,8 @@ Troubleshooting
 - **No response from Blender**: check the backend console for messages such as "Blender MCP not connected". Make sure the MCP panel is running on port 9876.
 - **Gemini errors**: verify your `GEMINI_API_KEY` and the model name in `backend/server.js`.
 - **Electron window blank**: wait for the React dev server to finish compiling or restart with `npm run dev`.
+- **Backend exits on start**: ensure `JWT_SECRET` and `DATABASE_URL` are set. The backend will terminate if `JWT_SECRET` is missing, and will throw if no database connection string is provided.
+- **Database connection errors**: confirm `DATABASE_URL` is valid and reachable. For Supabase, SSL is enabled automatically; for self-hosted Postgres, provide a standard connection string.
 
 Roadmap Ideas
 -------------
