@@ -25,11 +25,30 @@
 // export default App;
 
 import React, { useEffect } from 'react';
-import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
+import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import HomePage from './pages/homepage';
 import AuthPage from './pages/authpage';
 import GeneratorPage from './pages/generatorpage';
 import { testBlenderConnection } from './testBlender'; // ✅ Added for Blender MCP integration
+import { useAuth } from './context/AuthContext';
+
+function ProtectedRoute({ children }) {
+  const { token, loading } = useAuth();
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-black text-gray-200">
+        <p>Loading session…</p>
+      </div>
+    );
+  }
+
+  if (!token) {
+    return <Navigate to="/auth" replace />;
+  }
+
+  return children;
+}
 
 // ✅ Main App Component
 export default function App() {
@@ -44,7 +63,14 @@ export default function App() {
       <Routes>
         <Route path="/" element={<HomePage />} />
         <Route path="/auth" element={<AuthPage />} />
-        <Route path="/generate" element={<GeneratorPage />} />
+        <Route
+          path="/generate"
+          element={
+            <ProtectedRoute>
+              <GeneratorPage />
+            </ProtectedRoute>
+          }
+        />
       </Routes>
     </Router>
   );
