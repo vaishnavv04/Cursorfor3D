@@ -110,14 +110,6 @@ export default function AuthPage() {
             </>
           )}
         </p>
-
-        <button
-          onClick={() => window.open('https://supabase.com/docs/guides/auth', '_blank')}
-          className="mt-6 w-full bg-gray-800 py-3 rounded-lg hover:bg-gray-700 flex justify-center items-center space-x-2"
-        >
-          <span>🔗</span>
-          <span>Learn about federated login</span>
-        </button>
       </div>
     </div>
   );
