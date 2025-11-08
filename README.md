@@ -11,6 +11,8 @@ CursorFor3D is an experimental desktop workflow that connects an Electron + Reac
 - **Prompt Enhancement**: Automatically enhances user prompts for more detailed and accurate results
 - **Conversation History**: Maintains context across multiple interactions
 - **Scene Context Awareness**: Tracks current Blender scene state for intelligent modifications
+- **Multi-Agent Repair Pipeline**: LangGraph orchestrated agents auto-repair Blender errors before returning results
+- **Step-by-Step Progress Feed**: Backend emits structured timeline events for frontend progress visualizations
 
 Project Structure
 -----------------
@@ -83,6 +85,14 @@ npm install
 	npm run dev
 	```
 	This starts the React dev server on `http://localhost:3000` and launches the Electron window.
+
+Generation Pipeline & Progress Telemetry
+----------------------------------------
+
+- The backend now routes generations through a LangGraph workflow (`backend/agents/langgraphPipeline.js`) that manages prompt creation, preflight checks, Blender execution, and automatic repair attempts.
+- Each request builds a structured timeline via `backend/utils/progress.js`. The array is returned in every `/api/generate` response and saved on the assistant message for UI playback.
+- Dry-run and A/B flows skip execution but still record model/validation steps for consistent progress display.
+- Model selection gracefully handles Gemini aliases (e.g. `gemini-2.5-pro`) by mapping them to supported model IDs before calling the provider.
 
 Usage
 -----

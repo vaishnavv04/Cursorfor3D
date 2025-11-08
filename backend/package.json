@@ -11,7 +11,8 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@google/generative-ai": "^0.24.1",
+  "@google/generative-ai": "^0.24.1",
+  "@langchain/langgraph": "^1.0.1",
     "axios": "^1.12.2",
     "body-parser": "^2.2.0",
     "bcryptjs": "^2.4.3",

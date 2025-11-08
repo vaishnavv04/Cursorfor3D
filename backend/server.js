@@ -9,6 +9,8 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 import Groq from "groq-sdk";
 
 import { pool, initSchema, mapConversation, mapMessage } from "./db.js";
+import { runLangGraphPipeline } from "./agents/langgraphPipeline.js";
+import { createProgressTracker } from "./utils/progress.js";
 
 dotenv.config();
 
@@ -140,99 +142,466 @@ async function runGenerationCore(body, user) {
     debug = false,
     abTest = false,
     visualRefine = false,
-    agentType
+    agentType,
   } = body || {};
 
-  if (!prompt || !String(prompt).trim()) throw new Error('Prompt required');
-
-  let conversation;
-  if (conversationId) {
-    conversation = await getConversationForUser(user.id, conversationId);
-    if (!conversation) throw new Error('Conversation not found');
-  } else {
-    conversation = await createConversation(user.id, deriveTitleFromPrompt(String(prompt)));
-  }
-
-  const history = await getMessagesForHistory(conversation.id, 10);
-  let sceneContext = conversation.lastSceneContext || null;
-  if (blenderClient && blenderConnected) {
-    try { sceneContext = await sendCommandToBlender('get_scene_info', {}); } catch {}
-  }
-
-  const nonSystemHistory = history.filter((msg) => msg.role !== 'system');
-  let finalPrompt = String(prompt);
-  if (shouldEnhance) finalPrompt = await enhancePrompt(String(prompt), nonSystemHistory);
-
-  const sanitizedAttachments = (attachments || []).map(({ id, name, type, size }) => ({ id, name, type, size }));
-  await saveMessage(conversation.id, { role: 'user', content: finalPrompt, metadata: { originalPrompt: prompt, enhancedPrompt: shouldEnhance ? finalPrompt : null, attachments: sanitizedAttachments } });
-
-  const historyWithCurrent = [...nonSystemHistory, { role: 'user', content: finalPrompt }];
-  let systemPrompt = getSystemPrompt(historyWithCurrent.length > 1, sceneContext);
-  if (agentType && AGENT_TIPS[String(agentType).toLowerCase()]) {
-    systemPrompt = `${systemPrompt}\n\n${AGENT_TIPS[String(agentType).toLowerCase()]}`;
-  }
-  const conversationContext = historyWithCurrent.slice(-6).map((msg) => `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}`).join('\n\n');
-  const docSnippets = getRelevantDocs(finalPrompt);
-  const fullPromptBase = historyWithCurrent.length > 1 ? `${systemPrompt}\n\nConversation history:\n${conversationContext}\n\nCurrent user request: ${finalPrompt}` : `${systemPrompt}\n\nUser request: ${finalPrompt}`;
-  const fullPrompt = docSnippets.length ? `${fullPromptBase}\n\nHelpful API snippets:\n${docSnippets.map((t,i)=>`${i+1}. ${t}`).join('\n')}` : fullPromptBase;
-
-  // A/B mode returns quickly (no exec)
-  if (abTest) {
-    const attemptOrder = [];
-    const requestedModel = typeof model === 'string' ? model.toLowerCase() : '';
-    const preferGroq = requestedModel.includes('llama') || requestedModel.includes('groq');
-    if (preferGroq && groqClient) attemptOrder.push('groq');
-    if (genAI) attemptOrder.push('gemini');
-    if (groqClient && !preferGroq) attemptOrder.push('groq');
-    let code = '', providerUsed = '';
-    for (const p of attemptOrder) {
-      try {
-        if (p==='gemini' && genAI) { const m=genAI.getGenerativeModel({ model: GEMINI_MODEL }); const r=await m.generateContent(fullPrompt); code=(r?.response?.text?.()||'').trim(); if (code) { providerUsed='gemini'; break; } }
-        if (p==='groq' && groqClient) { const r=await groqClient.chat.completions.create({ model: GROQ_MODEL, messages:[{role:'user', content: fullPrompt}], temperature:0.2 }); code=(r?.choices?.[0]?.message?.content||'').trim(); if (code) { providerUsed='groq'; break; } }
-      } catch {}
-    }
-    const v1 = extractCodeFromText(code);
-    return { mode:'ab', variants:[ { provider: providerUsed, code: sanitizeBlenderCode(v1), preflightIssues: preflightValidateCode(sanitizeBlenderCode(v1)) } ], docSnippets, conversationId: conversation.id };
-  }
-
-  // Code-gen with cache
-  let providerUsed = '';
-  let code = '';
-  const cacheKey = !dryRun ? cacheKeyFromPrompt(fullPrompt) : null;
-  if (cacheKey) {
-    const cached = cacheGet(cacheKey);
-    if (cached?.code) { code = cached.code; providerUsed = cached.provider || providerUsed; }
-  }
-  if (!code) {
-    const attemptOrder = [];
-    const requestedModel = typeof model === 'string' ? model.toLowerCase() : '';
-    const preferGroq = requestedModel.includes('llama') || requestedModel.includes('groq');
-    if (preferGroq && groqClient) attemptOrder.push('groq');
-    if (genAI) attemptOrder.push('gemini');
-    if (groqClient && !preferGroq) attemptOrder.push('groq');
-    for (const p of attemptOrder) {
-      try {
-        if (p==='gemini' && genAI) { const m=genAI.getGenerativeModel({ model: GEMINI_MODEL }); const r=await m.generateContent(fullPrompt); code=(r?.response?.text?.()||'').trim(); if (code) { providerUsed='gemini'; break; } }
-        if (p==='groq' && groqClient) { const r=await groqClient.chat.completions.create({ model: GROQ_MODEL, messages:[{role:'user', content: fullPrompt}], temperature:0.2 }); code=(r?.choices?.[0]?.message?.content||'').trim(); if (code) { providerUsed='groq'; break; } }
-      } catch {}
-    }
-    if (cacheKey && code) cacheSet(cacheKey, { code, provider: providerUsed });
-  }
-  if (!code) throw new Error('No model output');
-
-  code = extractCodeFromText(code);
-  if (!code.includes('import bpy')) code = `import bpy\n${code}`;
-  code = sanitizeBlenderCode(code);
-  const preflightIssues = preflightValidateCode(code);
-  if (dryRun) return { mode:'dry_run', preflightIssues, sanitizedCode: code, provider: providerUsed, conversationId: conversation.id };
-
   const startedAt = Date.now();
-  const recovery = await tryExecuteWithRecovery({ initialCode: code, maxAttempts: Number(process.env.LLM_REPAIR_ATTEMPTS||2), preferGroq: providerUsed==='groq', sceneContext });
-  analytics.totalGenerations += 1; const ok = recovery.ok; if (ok) analytics.success += 1; else analytics.errors += 1; analytics.totalAttempts += (recovery.attempts||[]).length; analytics.totalDurationMs += (Date.now()-startedAt);
-  let screenshot = null;
-  if (ok && captureScreenshot && blenderClient && blenderConnected) { try { const img = await sendCommandToBlender('get_viewport_screenshot', { max_size: 800 }); screenshot = img?.data || img?.image || img || null; } catch {} }
-  await saveMessage(conversation.id, { role:'assistant', content: recovery.code || code, provider: providerUsed, blenderResult: recovery.result || null, sceneContext, metadata:{ attempts: recovery.attempts || [], preflightIssues } });
-  return { response: recovery.code || code, blenderResult: recovery.result || null, provider: providerUsed, conversationId: conversation.id, preflightIssues, screenshot };
+  const progress = createProgressTracker();
+  let analyticsRecorded = false;
+
+  const attachProgress = (error) => {
+    if (error && typeof error === "object") {
+      if (!error.progress) {
+        error.progress = progress.steps;
+      }
+    }
+    return error;
+  };
+
+  try {
+    progress.add("init", "Starting generation workflow");
+
+    const rawPrompt = typeof prompt === "string" ? prompt.trim() : "";
+    if (!rawPrompt) {
+      throw attachProgress(new Error("Prompt required"));
+    }
+
+    let conversation;
+    if (conversationId) {
+      progress.add("conversation_lookup", "Loading existing conversation", { conversationId });
+      conversation = await getConversationForUser(user.id, conversationId);
+      if (!conversation) {
+        throw attachProgress(new Error("Conversation not found"));
+      }
+      progress.merge("conversation_lookup", { message: "Conversation loaded", data: { conversationId: conversation.id } });
+    } else {
+      progress.add("conversation_create", "Creating new conversation");
+      conversation = await createConversation(user.id, deriveTitleFromPrompt(rawPrompt));
+      progress.merge("conversation_create", { message: "Conversation created", data: { conversationId: conversation.id } });
+    }
+
+    progress.add("history_fetch", "Fetching recent conversation history");
+    const history = await getMessagesForHistory(conversation.id, 10);
+    progress.merge("history_fetch", { message: "History fetched", data: { count: history.length } });
+
+    let sceneContext = conversation.lastSceneContext || null;
+    const blenderAvailable = Boolean(blenderClient && blenderConnected);
+    if (blenderAvailable) {
+      progress.add("scene_context", "Querying Blender for scene context");
+      try {
+        sceneContext = await sendCommandToBlender("get_scene_info", {});
+        progress.merge("scene_context", {
+          message: "Scene context retrieved",
+          data: { objectCount: sceneContext?.object_count ?? 0 },
+        });
+      } catch (err) {
+        progress.addError("scene_context", "Failed to fetch scene context", err?.message || String(err));
+      }
+    } else {
+      progress.add("scene_context_skipped", "Blender not connected, using cached scene context", {
+        cached: Boolean(sceneContext),
+      });
+    }
+
+    const nonSystemHistory = history.filter((msg) => msg.role !== "system");
+    let finalPrompt = rawPrompt;
+    if (shouldEnhance) {
+      progress.add("prompt_enhance", "Enhancing prompt via LLM");
+      try {
+        finalPrompt = await enhancePrompt(rawPrompt, nonSystemHistory);
+        progress.merge("prompt_enhance", { message: "Prompt enhanced" });
+      } catch (err) {
+        progress.addError("prompt_enhance", "Prompt enhancement failed", err?.message || String(err));
+        finalPrompt = rawPrompt;
+      }
+    }
+
+    const sanitizedAttachments = (attachments || []).map(({ id, name, type, size }) => ({
+      id,
+      name,
+      type,
+      size,
+    }));
+
+    progress.add("message_record", "Recording user message");
+    await saveMessage(conversation.id, {
+      role: "user",
+      content: finalPrompt,
+      metadata: {
+        originalPrompt: rawPrompt,
+        enhancedPrompt: shouldEnhance ? finalPrompt : null,
+        attachments: sanitizedAttachments,
+      },
+    });
+    progress.merge("message_record", { message: "User message recorded" });
+
+    const historyWithCurrent = [...nonSystemHistory, { role: "user", content: finalPrompt }];
+    let systemPrompt = getSystemPrompt(historyWithCurrent.length > 1, sceneContext);
+    if (agentType && AGENT_TIPS[String(agentType).toLowerCase()]) {
+      systemPrompt = `${systemPrompt}\n\n${AGENT_TIPS[String(agentType).toLowerCase()]}`;
+    }
+
+    const conversationContext = historyWithCurrent
+      .slice(-6)
+      .map((msg) => `${msg.role === "user" ? "User" : "Assistant"}: ${msg.content}`)
+      .join("\n\n");
+
+    const docSnippets = getRelevantDocs(finalPrompt);
+    let generationPrompt = historyWithCurrent.length > 1
+      ? `${systemPrompt}\n\nConversation history:\n${conversationContext}\n\nCurrent user request: ${finalPrompt}`
+      : `${systemPrompt}\n\nUser request: ${finalPrompt}`;
+    if (docSnippets.length) {
+      generationPrompt = `${generationPrompt}\n\nHelpful API snippets:\n${docSnippets.map((t, i) => `${i + 1}. ${t}`).join("\n")}`;
+    }
+    progress.add("prompt_ready", "Prepared generation prompt", { docSnippetCount: docSnippets.length });
+
+    const shouldCache = !dryRun && !abTest && !visualRefine;
+    const cacheKey = shouldCache ? cacheKeyFromPrompt(generationPrompt) : null;
+    let cachedGeneration = null;
+    if (cacheKey) {
+      const cached = cacheGet(cacheKey);
+      if (cached?.code) {
+        cachedGeneration = { code: cached.code, provider: cached.provider || null };
+        progress.add("model_cache_hit", "Cache hit for generation prompt", { provider: cachedGeneration.provider });
+      }
+    }
+
+    const modelSelection = resolveModelSelection(model);
+    progress.add("model_resolved", "Resolved model preference", {
+      provider: modelSelection.provider,
+      model: modelSelection.modelName,
+      cacheHit: Boolean(cachedGeneration),
+    });
+
+    const generateWithProvider = async (promptText, providerName, modelId) => {
+      if (cachedGeneration) {
+        const reuse = cachedGeneration;
+        cachedGeneration = null;
+        progress.add("model_cache_reuse", "Using cached generation result", {
+          provider: reuse.provider || providerName,
+        });
+        return reuse;
+      }
+
+      if (providerName === "gemini") {
+        if (!genAI) {
+          throw new Error("Gemini provider is not configured");
+        }
+        const modelIdToUse = modelId || GEMINI_MODEL;
+        const modelClient = genAI.getGenerativeModel({ model: modelIdToUse });
+        const result = await modelClient.generateContent(promptText);
+        const text = extractCodeFromText(result?.response?.text?.() || "").trim();
+        return { code: text, provider: "gemini" };
+      }
+
+      if (providerName === "groq") {
+        if (!groqClient) {
+          throw new Error("Groq provider is not configured");
+        }
+        const response = await groqClient.chat.completions.create({
+          model: modelId || GROQ_MODEL,
+          messages: [{ role: "user", content: promptText }],
+          temperature: 0.2,
+        });
+        const text = extractCodeFromText(response?.choices?.[0]?.message?.content || "").trim();
+        return { code: text, provider: "groq" };
+      }
+
+      throw new Error(`Unsupported provider: ${providerName}`);
+    };
+
+    if (abTest) {
+      progress.add("ab_test_start", "Running A/B generation test");
+      const variants = [];
+
+      const primary = await generateWithProvider(generationPrompt, modelSelection.provider, modelSelection.modelName);
+      const primaryCode = sanitizeBlenderCode(extractCodeFromText(primary.code || ""));
+      variants.push({
+        provider: primary.provider || modelSelection.provider,
+        code: primaryCode,
+        preflightIssues: preflightValidateCode(primaryCode),
+      });
+
+      const alternateProvider = modelSelection.provider === "gemini"
+        ? (groqClient ? "groq" : null)
+        : (genAI ? "gemini" : null);
+      if (alternateProvider) {
+        try {
+          const alt = await generateWithProvider(
+            generationPrompt,
+            alternateProvider,
+            alternateProvider === "gemini" ? GEMINI_MODEL : GROQ_MODEL,
+          );
+          const altCode = sanitizeBlenderCode(extractCodeFromText(alt.code || ""));
+          variants.push({
+            provider: alt.provider || alternateProvider,
+            code: altCode,
+            preflightIssues: preflightValidateCode(altCode),
+          });
+        } catch (err) {
+          progress.addError("ab_test_alt_error", "Alternate provider failed during A/B", err?.message || String(err));
+        }
+      }
+
+      analytics.totalGenerations += 1;
+      analytics.totalDurationMs += Date.now() - startedAt;
+      analyticsRecorded = true;
+
+      progress.add("ab_test_complete", "A/B generation complete", { variantCount: variants.length });
+
+      return {
+        mode: "ab",
+        variants,
+        docSnippets,
+        conversationId: conversation.id,
+        progress: progress.steps,
+      };
+    }
+
+    const pipelineResult = await runLangGraphPipeline({
+      generationPrompt,
+      provider: modelSelection.provider,
+      modelName: modelSelection.modelName,
+      generateWithProvider,
+      sanitizeCode: sanitizeBlenderCode,
+      preflightCheck: preflightValidateCode,
+      executeInBlender: async (code) => {
+        if (!blenderAvailable) {
+          throw new Error("Blender addon is not connected. Please make sure Blender is running with the addon enabled.");
+        }
+        const response = await executeBlenderCode(code);
+        if (response && response.error) {
+          const err = new Error(response.error);
+          err.details = response;
+          throw err;
+        }
+        return response;
+      },
+      repairWithLLM: (repairPrompt, preferGroqFirst) => callLLMForCode(repairPrompt, preferGroqFirst),
+      progress,
+      maxRepairs: Number(process.env.AGENT_MAX_REPAIRS ?? process.env.LLM_REPAIR_ATTEMPTS ?? 2),
+      skipExecution: dryRun || !blenderAvailable,
+    });
+
+    if (pipelineResult.error) {
+      throw attachProgress(new Error(pipelineResult.error));
+    }
+
+    const finalProvider = pipelineResult.provider || modelSelection.provider;
+    const rawCode = pipelineResult.code || "";
+    const sanitizedCode = pipelineResult.sanitizedCode || sanitizeBlenderCode(rawCode);
+    const preflightIssues = pipelineResult.preflightIssues || preflightValidateCode(sanitizedCode);
+    const attempts = pipelineResult.attempts || [];
+    const executionOk = pipelineResult.executionOk !== false;
+
+    let blenderResult = pipelineResult.blenderResult || null;
+    if (!dryRun && !blenderAvailable) {
+      blenderResult = blenderResult || {
+        status: "skipped",
+        error: "Blender addon is not connected. Please make sure Blender is running with the addon enabled.",
+      };
+    }
+
+    if (!dryRun && blenderAvailable && !executionOk) {
+      const reason = pipelineResult.lastError || "Blender execution failed";
+      throw attachProgress(new Error(reason));
+    }
+
+    if (shouldCache && cacheKey && pipelineResult.code) {
+      cacheSet(cacheKey, { code: pipelineResult.code, provider: finalProvider });
+      progress.add("model_cache_store", "Stored generation result in cache", { provider: finalProvider });
+    }
+
+    analytics.totalGenerations += 1;
+    analytics.totalAttempts += attempts.length;
+    analytics.totalDurationMs += Date.now() - startedAt;
+    if (dryRun || executionOk) {
+      analytics.success += 1;
+    } else {
+      analytics.errors += 1;
+    }
+    analyticsRecorded = true;
+
+    if (dryRun) {
+      let critique = "";
+      try {
+        const critiquePrompt = `You are reviewing Blender 4.5 Python code. Briefly list issues and propose concrete fixes. Return a short bullet list of suggestions, no code fences.\n\nCODE:\n${sanitizedCode}`;
+        const { code: reviewText } = await callLLMForCode(critiquePrompt, false);
+        critique = reviewText;
+      } catch (err) {
+        progress.addError("dry_run_critique", "Failed to produce critique", err?.message || String(err));
+      }
+
+      return {
+        mode: "dry_run",
+        preflightIssues,
+        critique,
+        sanitizedCode,
+        provider: finalProvider,
+        conversationId: conversation.id,
+        progress: progress.steps,
+      };
+    }
+
+    let screenshot = null;
+    if (captureScreenshot && executionOk && blenderAvailable) {
+      progress.add("screenshot", "Capturing viewport screenshot");
+      try {
+        const shot = await sendCommandToBlender("get_viewport_screenshot", { max_size: 800 });
+        screenshot = shot?.data || shot?.image || shot || null;
+        progress.merge("screenshot", { message: "Screenshot captured" });
+      } catch (err) {
+        progress.addError("screenshot", "Viewport screenshot failed", err?.message || String(err));
+      }
+    }
+
+    let assistantCode = sanitizedCode;
+    let visualRefinement = undefined;
+
+    if (visualRefine && executionOk && blenderAvailable && genAI) {
+      progress.add("visual_refine", "Requesting visual refinement from Gemini");
+      try {
+        if (!screenshot) {
+          const shot = await sendCommandToBlender("get_viewport_screenshot", { max_size: 800 });
+          screenshot = shot?.data || shot?.image || shot || null;
+        }
+
+        if (screenshot) {
+          const base64 = typeof screenshot === "string" ? screenshot : Buffer.from(screenshot).toString("base64");
+          const critiqueText = "You are reviewing the Blender viewport image against the user request. 1) Briefly state if the image matches the request. 2) If not perfect, output ONLY Blender Python code to refine the scene (no markdown).";
+          const modelClient = genAI.getGenerativeModel({ model: GEMINI_MODEL });
+          const visionResp = await modelClient.generateContent([
+            { text: `USER REQUEST: ${finalPrompt}` },
+            { text: critiqueText },
+            { inlineData: { data: base64, mimeType: "image/png" } },
+          ]);
+          const visionOut = (visionResp?.response?.text?.() || "").trim();
+          const refinedCode = extractCodeFromText(visionOut);
+          visualRefinement = { critique: summarizeText(visionOut, 1200), applied: false };
+          if (refinedCode && /import\s+bpy/.test(refinedCode)) {
+            try {
+              const refinementResult = await executeBlenderCode(sanitizeBlenderCode(refinedCode));
+              assistantCode = `${assistantCode}\n\n# --- Visual refinement applied ---\n${sanitizeBlenderCode(refinedCode)}`;
+              visualRefinement.applied = true;
+              blenderResult = refinementResult || blenderResult;
+              progress.merge("visual_refine", { message: "Visual refinement applied" });
+            } catch (err) {
+              progress.addError("visual_refine", "Visual refinement execution failed", err?.message || String(err));
+            }
+          }
+        } else {
+          progress.merge("visual_refine", { message: "Skipped visual refinement due to missing screenshot" });
+        }
+      } catch (err) {
+        progress.addError("visual_refine", "Visual refinement skipped", err?.message || String(err));
+      }
+    }
+
+    await saveMessage(conversation.id, {
+      role: "assistant",
+      content: assistantCode,
+      provider: finalProvider,
+      blenderResult,
+      sceneContext,
+      metadata: {
+        enhancedPrompt: shouldEnhance ? finalPrompt : null,
+        attachments: sanitizedAttachments,
+        model: finalProvider,
+        attempts,
+        preflightIssues,
+        progress: progress.steps,
+      },
+    });
+
+    const updatedConversation = await touchConversation(conversation.id, {
+      sceneContext,
+      title:
+        conversation.title === "New Scene" || !conversation.title
+          ? deriveTitleFromPrompt(rawPrompt)
+          : undefined,
+    });
+
+    const messages = await getConversationMessages(conversation.id);
+
+    return {
+      response: assistantCode,
+      blenderResult,
+      provider: finalProvider,
+      conversationId: conversation.id,
+      conversationTitle: updatedConversation?.title || conversation.title,
+      enhancedPrompt: shouldEnhance ? finalPrompt : null,
+      sceneContext,
+      messages,
+      attempts,
+      preflightIssues,
+      screenshot,
+      visualRefinement,
+      docSnippets,
+      progress: progress.steps,
+      debugArtifacts: debug ? { fullPrompt: generationPrompt, systemPrompt, docSnippets } : undefined,
+    };
+  } catch (err) {
+    if (!analyticsRecorded) {
+      analytics.totalGenerations += 1;
+      analytics.errors += 1;
+      analytics.totalDurationMs += Date.now() - startedAt;
+    }
+    throw attachProgress(err instanceof Error ? err : new Error(String(err)));
+  }
+}
+
+function resolveModelSelection(requestedModel) {
+  const normalized = typeof requestedModel === "string" ? requestedModel.toLowerCase().trim() : "";
+
+  const prefersGroq = /groq|llama/.test(normalized);
+  const prefersGemini = /gemini|google/.test(normalized);
+
+  if (prefersGroq && groqClient) {
+    let modelName = GROQ_MODEL;
+    if (/70b/.test(normalized)) {
+      modelName = "llama3-70b-8192";
+    } else if (/8b/.test(normalized)) {
+      modelName = "llama3-8b-8192";
+    }
+    return { provider: "groq", modelName };
+  }
+
+  if (prefersGemini && genAI) {
+    const sanitized = normalized.replace(/_/g, "-");
+    const aliasMap = {
+      gemini: GEMINI_MODEL,
+      "gemini-2.0-flash": GEMINI_MODEL,
+      "gemini-2.0-flash-lite": GEMINI_MODEL,
+      "gemini-2.5-pro": GEMINI_MODEL,
+      "gemini-2.5-flash": GEMINI_MODEL,
+      "gemini-2.5-flash-lite": GEMINI_MODEL,
+    };
+    const allowedGeminiModels = new Set([
+      GEMINI_MODEL,
+      "gemini-1.5-pro",
+      "gemini-1.5-pro-latest",
+      "gemini-1.5-flash",
+      "gemini-1.5-flash-latest",
+    ]);
+    const mapped = aliasMap[sanitized] || (allowedGeminiModels.has(sanitized) ? sanitized : GEMINI_MODEL);
+    return { provider: "gemini", modelName: mapped };
+  }
+
+  if (genAI) {
+    return { provider: "gemini", modelName: GEMINI_MODEL };
+  }
+
+  if (groqClient) {
+    return { provider: "groq", modelName: GROQ_MODEL };
+  }
+
+  throw new Error("No model providers configured");
+}
+
+function summarizeText(text, maxLength = 400) {
+  if (!text) return "";
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength)}…`;
 }
 
 
@@ -1557,347 +1926,26 @@ app.get("/api/jobs/:id/status", authenticate, async (req, res) => {
 
 app.post("/api/generate", authenticate, async (req, res) => {
   try {
-    // Rate limit per user
     const rl = checkRateLimit(req.user.id);
     if (!rl.ok) {
-      res.set('Retry-After', Math.ceil(rl.retryAfterMs / 1000));
+      res.set("Retry-After", Math.ceil(rl.retryAfterMs / 1000));
       return res.status(429).json({ error: "Rate limit exceeded", retryAfterMs: rl.retryAfterMs });
     }
 
-    const startedAt = Date.now();
-    const { prompt, conversationId, enhancePrompt: shouldEnhance, attachments = [], model, dryRun = false, captureScreenshot = false, debug = false, abTest = false, visualRefine = false, agentType } = req.body || {};
-    if (!prompt || !prompt.trim()) {
-      return res.status(400).json({ error: "Prompt required" });
-    }
-
-    let conversation;
-    if (conversationId) {
-      conversation = await getConversationForUser(req.user.id, conversationId);
-      if (!conversation) {
-        return res.status(404).json({ error: "Conversation not found" });
-      }
-    } else {
-      conversation = await createConversation(req.user.id, deriveTitleFromPrompt(prompt));
-    }
-
-    const history = await getMessagesForHistory(conversation.id, 10);
-
-    let sceneContext = conversation.lastSceneContext || null;
-    if (blenderClient && blenderConnected) {
-      try {
-        sceneContext = await sendCommandToBlender("get_scene_info", {});
-      } catch (err) {
-        console.warn("⚠️ Could not get scene info:", err.message);
-      }
-    }
-
-    const nonSystemHistory = history.filter((msg) => msg.role !== "system");
-    let finalPrompt = prompt;
-    if (shouldEnhance) {
-      finalPrompt = await enhancePrompt(prompt, nonSystemHistory);
-    }
-
-    const sanitizedAttachments = (attachments || []).map(({ id, name, type, size }) => ({
-      id,
-      name,
-      type,
-      size,
-    }));
-
-    await saveMessage(conversation.id, {
-      role: "user",
-      content: finalPrompt,
-      metadata: {
-        originalPrompt: prompt,
-        enhancedPrompt: shouldEnhance ? finalPrompt : null,
-        attachments: sanitizedAttachments,
-      },
-    });
-
-    const historyWithCurrent = [...nonSystemHistory, { role: "user", content: finalPrompt }];
-    let systemPrompt = getSystemPrompt(historyWithCurrent.length > 1, sceneContext);
-    if (agentType && AGENT_TIPS[String(agentType).toLowerCase()]) {
-      systemPrompt = `${systemPrompt}\n\n${AGENT_TIPS[String(agentType).toLowerCase()]}`;
-    }
-    const docSnippets = getRelevantDocs(finalPrompt);
-    const conversationContext = historyWithCurrent
-      .slice(-6)
-      .map((msg) => `${msg.role === "user" ? "User" : "Assistant"}: ${msg.content}`)
-      .join("\n\n");
-
-    const fullPromptBase = historyWithCurrent.length > 1
-      ? `${systemPrompt}\n\nConversation history:\n${conversationContext}\n\nCurrent user request: ${finalPrompt}`
-      : `${systemPrompt}\n\nUser request: ${finalPrompt}`;
-    const fullPrompt = docSnippets.length
-      ? `${fullPromptBase}\n\nHelpful API snippets:\n${docSnippets.map((t,i)=>`${i+1}. ${t}`).join('\n')}`
-      : fullPromptBase;
-
-    // Code-gen cache (skip cache for dryRun and abTest)
-    let cacheHit = false;
-    let cacheKey = !dryRun && !abTest ? cacheKeyFromPrompt(fullPrompt) : null;
-    if (cacheKey) {
-      const cached = cacheGet(cacheKey);
-      if (cached?.code) {
-        code = cached.code;
-        providerUsed = cached.provider || providerUsed;
-        cacheHit = true;
-      }
-    }
-
-    const requestedModel = typeof model === "string" ? model.toLowerCase() : "";
-    const preferGroq = requestedModel.includes("llama") || requestedModel.includes("groq");
-
-    const attemptOrder = [];
-    if (preferGroq && groqClient) attemptOrder.push("groq");
-    if (genAI) attemptOrder.push("gemini");
-    if (groqClient && !preferGroq) attemptOrder.push("groq");
-
-    let code = "";
-    let providerUsed = "";
-
-    for (const provider of attemptOrder) {
-      if (cacheHit) break;
-      if (provider === "gemini" && genAI) {
-      try {
-        const geminiModel = genAI.getGenerativeModel({ model: GEMINI_MODEL });
-          const result = await geminiModel.generateContent(fullPrompt);
-  code = (result?.response?.text?.() || "").trim();
-          if (code) {
-        providerUsed = "gemini";
-            break;
-          }
-        } catch (err) {
-          console.error("❌ Gemini generation failed:", err.message);
-        }
-      }
-
-      if (provider === "groq" && groqClient) {
-        try {
-          const groqResponse = await groqClient.chat.completions.create({
-          model: GROQ_MODEL,
-            messages: [{ role: "user", content: fullPrompt }],
-            temperature: 0.2,
-          });
-          const groqText = (groqResponse?.choices?.[0]?.message?.content || "").trim();
-          if (groqText) {
-  code = groqText;
-            providerUsed = "groq";
-            break;
-          }
-        } catch (err) {
-          console.error("❌ Groq generation failed:", err.message);
-        }
-      }
-    }
-
-    if (!cacheHit && cacheKey && code) {
-      cacheSet(cacheKey, { code, provider: providerUsed });
-    }
-
-    // Optional A/B testing: produce two variants without executing; caller evaluates
-    if (abTest) {
-      const altOrder = [...attemptOrder].reverse();
-      let altCode = ""; let altProvider = "";
-      for (const provider of altOrder) {
-        try {
-          if (provider === 'gemini' && genAI) {
-            const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
-            const result = await model.generateContent(fullPrompt);
-            altCode = (result?.response?.text?.() || '').trim();
-            if (altCode) { altProvider = 'gemini'; break; }
-          }
-          if (provider === 'groq' && groqClient) {
-            const resp = await groqClient.chat.completions.create({ model: GROQ_MODEL, messages: [{ role:'user', content: fullPrompt }], temperature: 0.2 });
-            altCode = (resp?.choices?.[0]?.message?.content || '').trim();
-            if (altCode) { altProvider = 'groq'; break; }
-          }
-        } catch {}
-      }
-      const v1 = extractCodeFromText(code);
-      const v2 = extractCodeFromText(altCode);
-      analytics.totalGenerations += 1;
-      return res.json({ mode: 'ab', variants: [
-        { provider: providerUsed, code: sanitizeBlenderCode(v1), preflightIssues: preflightValidateCode(sanitizeBlenderCode(v1)) },
-        { provider: altProvider, code: sanitizeBlenderCode(v2), preflightIssues: preflightValidateCode(sanitizeBlenderCode(v2)) },
-      ], docSnippets, conversationId: conversation.id });
-    }
-
-    if (!code) {
-      return res.status(503).json({
-        error: "No model output",
-        details: "Neither Gemini nor Groq returned Blender code.",
-      });
-    }
-
-    const codeBlockMatch = code.match(/```(?:python|py)?\s*([\s\S]*?)```/);
-    code = codeBlockMatch ? codeBlockMatch[1].trim() : code.replace(/```/g, "").trim();
-
-    if (!code.includes("import bpy")) {
-      console.warn("⚠️ Code missing 'import bpy' — adding it");
-      code = `import bpy\n${code}`;
-    }
-
-    code = sanitizeBlenderCode(code);
-
-    const preflightIssues = preflightValidateCode(code);
-    if (dryRun) {
-      const critiquePrompt = `You are reviewing Blender 4.5 Python code. Briefly list issues and propose concrete fixes. Return a short bullet list of suggestions, no code fences.\n\nCODE:\n${code}`;
-      let critique = "";
-      try {
-        const { code: reviewText } = await callLLMForCode(critiquePrompt, false);
-        critique = reviewText;
-      } catch {}
-      return res.json({
-        mode: "dry_run",
-        preflightIssues,
-        critique,
-        sanitizedCode: code,
-        provider: providerUsed || (genAI ? "gemini" : groqClient ? "groq" : "unknown"),
-        conversationId: conversation.id,
-      });
-    }
-
-    let blenderResult = null;
-    let attempts = [];
-    if (blenderClient && blenderConnected) {
-      try {
-        console.log("🚀 Executing code in Blender (with auto-repair)...");
-        const preferGroq = providerUsed === "groq";
-        const recovery = await tryExecuteWithRecovery({
-          initialCode: code,
-          maxAttempts: Number(process.env.LLM_REPAIR_ATTEMPTS || 2),
-          preferGroq,
-          sceneContext,
-        });
-        attempts = recovery.attempts || [];
-        if (recovery.ok) {
-          blenderResult = recovery.result;
-          code = recovery.code; // final executed code (possibly repaired)
-          console.log("✅ Code executed successfully in Blender after attempts:", attempts.length);
-        } else {
-          throw new Error(recovery.error || "Execution failed");
-        }
-      } catch (toolError) {
-        console.error("❌ Blender execution error:", toolError.message || toolError);
-        blenderResult = {
-          error: toolError.message || toolError.toString(),
-          status: "error",
-        };
-      }
-    } else {
-      console.warn("⚠️ Blender not connected — code will not be executed");
-      blenderResult = {
-        error: "Blender addon is not connected. Please make sure Blender is running with the addon enabled.",
-        status: "error",
-      };
-    }
-
-    await saveMessage(conversation.id, {
-      role: "assistant",
-      content: code,
-      provider: providerUsed || (genAI ? "gemini" : groqClient ? "groq" : "unknown"),
-      blenderResult,
-      sceneContext,
-      metadata: {
-        enhancedPrompt: shouldEnhance ? finalPrompt : null,
-        attachments: sanitizedAttachments,
-        model: providerUsed || null,
-        attempts,
-        preflightIssues,
-      },
-    });
-
-    const updatedConversation = await touchConversation(conversation.id, {
-      sceneContext,
-      title:
-        conversation.title === "New Scene" || !conversation.title
-          ? deriveTitleFromPrompt(prompt)
-          : undefined,
-    });
-
-    const messages = await getConversationMessages(conversation.id);
-
-    // Optional viewport screenshot on success
-    let screenshot = null;
-    if (captureScreenshot && blenderResult && !blenderResult.error && blenderClient && blenderConnected) {
-      try {
-        const img = await sendCommandToBlender("get_viewport_screenshot", { max_size: 800 });
-        screenshot = img?.data || img?.image || img || null;
-      } catch (err) {
-        console.warn("⚠️ Screenshot failed:", err.message);
-      }
-    }
-
-    // Optional visual refinement pass using screenshot (Gemini only). Limited to 1 refinement attempt.
-    let visualRefinement = undefined;
-    if (visualRefine && blenderResult && !blenderResult.error && blenderClient && blenderConnected && genAI) {
-      try {
-        // Ensure we have a screenshot to review
-        if (!screenshot) {
-          try {
-            const img = await sendCommandToBlender("get_viewport_screenshot", { max_size: 800 });
-            screenshot = img?.data || img?.image || img || null;
-          } catch (err) {
-            console.warn("⚠️ Screenshot for visual refinement failed:", err.message);
-          }
-        }
-
-        if (screenshot) {
-          const base64 = typeof screenshot === 'string' ? screenshot : Buffer.from(screenshot).toString('base64');
-          const critiqueText = `You are reviewing the Blender viewport image against the user request. 1) Briefly state if the image matches the request. 2) If not perfect, output ONLY Blender Python code to refine the scene (no markdown).`;
-          const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
-          const visionResp = await model.generateContent([
-            { text: `USER REQUEST: ${finalPrompt}\n${shouldEnhance ? `(enhanced) ${finalPrompt}` : ''}` },
-            { text: critiqueText },
-            { inlineData: { data: base64, mimeType: 'image/png' } },
-          ]);
-          const visionOut = (visionResp?.response?.text?.() || '').trim();
-          const refinedCode = extractCodeFromText(visionOut);
-          visualRefinement = { critique: visionOut.slice(0, 1200), applied: false };
-          if (refinedCode && /import\s+bpy/.test(refinedCode)) {
-            const recovery = await tryExecuteWithRecovery({
-              initialCode: refinedCode,
-              maxAttempts: 1,
-              preferGroq: providerUsed === 'groq',
-              sceneContext,
-            });
-            attempts = attempts.concat(recovery.attempts || []);
-            if (recovery.ok) {
-              code = `${code}\n\n# --- Visual refinement applied ---\n${recovery.code}`;
-              visualRefinement.applied = true;
-            }
-          }
-        }
-      } catch (err) {
-        console.warn("⚠️ Visual refinement skipped:", err.message);
-      }
-    }
-
-    analytics.totalGenerations += 1;
-    const ok = blenderResult && !blenderResult.error;
-    if (ok) analytics.success += 1; else analytics.errors += 1;
-    analytics.totalAttempts += (attempts?.length || 0);
-    analytics.totalDurationMs += (Date.now() - startedAt);
-
-    res.json({
-      response: code,
-      blenderResult,
-      provider: providerUsed || (genAI ? "gemini" : groqClient ? "groq" : "unknown"),
-      conversationId: conversation.id,
-      conversationTitle: updatedConversation?.title || conversation.title,
-      enhancedPrompt: shouldEnhance ? finalPrompt : null,
-      sceneContext,
-      messages,
-      attempts,
-      preflightIssues,
-      screenshot,
-      visualRefinement,
-      debugArtifacts: debug ? { fullPrompt, systemPrompt, docSnippets } : undefined,
-    });
+    const result = await runGenerationCore(req.body || {}, req.user);
+    res.json(result);
   } catch (err) {
-    analytics.totalGenerations += 1; analytics.errors += 1;
-    console.error("❌ GENERATION ERROR:", err);
-    res.status(500).json({ error: "Model generation failed", details: err.message });
+    const status = err?.message === "Prompt required"
+      ? 400
+      : err?.message === "Conversation not found"
+        ? 404
+        : 500;
+    console.error("❌ GENERATION ERROR:", err?.message || err);
+    res.status(status).json({
+      error: err?.message || "Model generation failed",
+      details: err?.details || null,
+      progress: err?.progress || [],
+    });
   }
 });
 
