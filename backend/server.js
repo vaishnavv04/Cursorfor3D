@@ -9,7 +9,7 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 import Groq from "groq-sdk";
 
 import { pool, initSchema, mapConversation, mapMessage } from "./db.js";
-import { runLangGraphPipeline } from "./agents/langgraphPipeline.js";
+// import { runLangGraphPipeline } from "./agents/langgraphPipeline.js";
 import { createProgressTracker } from "./utils/progress.js";
 
 dotenv.config();
@@ -32,8 +32,33 @@ const genAI = process.env.GEMINI_API_KEY
   ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
   : null;
 const groqClient = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-const GROQ_MODEL = process.env.GROQ_MODEL || "llama3-70b-8192";
+const GEMINI_MODEL = "gemini-2.5-flash";
+const PROMPT_ENHANCER_MODEL = "llama-3.1-8b-instant";
+
+const ASSET_CREATION_STRATEGY_PROMPT = `
+ASSET CREATION STRATEGY (MANDATORY):
+1. Always start by calling get_scene_info() to understand the current scene.
+2. For each asset you need, check integration status in this order and prefer assets over manual modeling:
+   a. Call get_polyhaven_status(), get_sketchfab_status(), and get_hyper3d_status() to know what is available.
+   b. If PolyHaven is enabled:
+      - Use download_polyhaven_asset(asset_type="models") for generic objects/furniture.
+      - Use download_polyhaven_asset(asset_type="textures") for materials.
+      - Use download_polyhaven_asset(asset_type="hdris") for environment lighting.
+   c. If Sketchfab is enabled (best for realistic/specific items):
+      - Use search_sketchfab_models(query) then download_sketchfab_model(uid) for downloadable models.
+   d. If Hyper3D is enabled (best for unique/custom items):
+      - Use generate_hyper3d_model_via_images() when images are provided.
+      - Otherwise use generate_hyper3d_model_via_text().
+      - Poll with poll_rodin_job_status() until complete, import via import_generated_asset().
+      - If free trial key is exhausted, tell the user the suggested next steps (wait, get API key, or fal.ai key) and fall back to next integration.
+3. After an asset is imported from any source:
+   - Get its world_bounding_box.
+   - Adjust location, scale, and rotation so it sits correctly in the scene, with no clipping.
+   - Ensure spatial relationships are correct relative to other objects.
+4. Only fall back to procedural Blender Python modeling when ALL integrations are unavailable or unsuitable, or when the user explicitly requests primitives/basic materials.
+5. For multiple assets, repeat the checks per asset and keep the scene consistent.
+6. Never attempt to generate ground or entire scenes with Hyper3D; it is for single objects only.
+`;
 
 // Simple LRU cache for code generation results (prompt -> code)
 const crypto = await import('node:crypto');
@@ -75,18 +100,8 @@ const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 30);
 const rateState = new Map(); // userId -> { count, resetAt }
 
 function checkRateLimit(userId) {
-  const now = Date.now();
-  const st = rateState.get(userId) || { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
-  if (now > st.resetAt) {
-    st.count = 0; st.resetAt = now + RATE_LIMIT_WINDOW_MS;
-  }
-  if (st.count >= RATE_LIMIT_MAX) {
-    const retry = Math.max(0, st.resetAt - now);
-    return { ok: false, retryAfterMs: retry };
-  }
-  st.count += 1;
-  rateState.set(userId, st);
-  return { ok: true };
+  // Rate limiting disabled for now
+  return { ok: true, retryAfterMs: 0 };
 }
 
 // Basic analytics (in-memory since boot)
@@ -136,7 +151,6 @@ async function runGenerationCore(body, user) {
     conversationId,
     enhancePrompt: shouldEnhance,
     attachments = [],
-    model,
     dryRun = false,
     captureScreenshot = false,
     debug = false,
@@ -186,6 +200,8 @@ async function runGenerationCore(body, user) {
 
     let sceneContext = conversation.lastSceneContext || null;
     const blenderAvailable = Boolean(blenderClient && blenderConnected);
+    let integrationStatus = { hyper3d: false, polyhaven: false, sketchfab: false };
+    
     if (blenderAvailable) {
       progress.add("scene_context", "Querying Blender for scene context");
       try {
@@ -197,6 +213,27 @@ async function runGenerationCore(body, user) {
       } catch (err) {
         progress.addError("scene_context", "Failed to fetch scene context", err?.message || String(err));
       }
+      
+      // Check integration status
+      progress.add("integration_check", "Checking available asset integrations");
+      try {
+        const hyper3dStatus = await sendCommandToBlender("get_hyper3d_status", {}).catch(() => ({ enabled: false }));
+        const polyhavenStatus = await sendCommandToBlender("get_polyhaven_status", {}).catch(() => ({ enabled: false }));
+        const sketchfabStatus = await sendCommandToBlender("get_sketchfab_status", {}).catch(() => ({ enabled: false }));
+        
+        integrationStatus = {
+          hyper3d: hyper3dStatus?.enabled === true,
+          polyhaven: polyhavenStatus?.enabled === true,
+          sketchfab: sketchfabStatus?.enabled === true,
+        };
+        
+        progress.merge("integration_check", {
+          message: "Integration status checked",
+          data: integrationStatus,
+        });
+      } catch (err) {
+        progress.addError("integration_check", "Failed to check integration status", err?.message || String(err));
+      }
     } else {
       progress.add("scene_context_skipped", "Blender not connected, using cached scene context", {
         cached: Boolean(sceneContext),
@@ -204,17 +241,7 @@ async function runGenerationCore(body, user) {
     }
 
     const nonSystemHistory = history.filter((msg) => msg.role !== "system");
-    let finalPrompt = rawPrompt;
-    if (shouldEnhance) {
-      progress.add("prompt_enhance", "Enhancing prompt via LLM");
-      try {
-        finalPrompt = await enhancePrompt(rawPrompt, nonSystemHistory);
-        progress.merge("prompt_enhance", { message: "Prompt enhanced" });
-      } catch (err) {
-        progress.addError("prompt_enhance", "Prompt enhancement failed", err?.message || String(err));
-        finalPrompt = rawPrompt;
-      }
-    }
+    let finalPrompt = rawPrompt; // Prompt enhancement disabled
 
     const sanitizedAttachments = (attachments || []).map(({ id, name, type, size }) => ({
       id,
@@ -236,7 +263,7 @@ async function runGenerationCore(body, user) {
     progress.merge("message_record", { message: "User message recorded" });
 
     const historyWithCurrent = [...nonSystemHistory, { role: "user", content: finalPrompt }];
-    let systemPrompt = getSystemPrompt(historyWithCurrent.length > 1, sceneContext);
+    let systemPrompt = getSystemPrompt(historyWithCurrent.length > 1, sceneContext, integrationStatus);
     if (agentType && AGENT_TIPS[String(agentType).toLowerCase()]) {
       systemPrompt = `${systemPrompt}\n\n${AGENT_TIPS[String(agentType).toLowerCase()]}`;
     }
@@ -257,159 +284,63 @@ async function runGenerationCore(body, user) {
 
     const shouldCache = !dryRun && !abTest && !visualRefine;
     const cacheKey = shouldCache ? cacheKeyFromPrompt(generationPrompt) : null;
-    let cachedGeneration = null;
+    let cachedCode = null;
     if (cacheKey) {
       const cached = cacheGet(cacheKey);
       if (cached?.code) {
-        cachedGeneration = { code: cached.code, provider: cached.provider || null };
-        progress.add("model_cache_hit", "Cache hit for generation prompt", { provider: cachedGeneration.provider });
+        cachedCode = cached.code;
+        progress.add("model_cache_hit", "Cache hit for generation prompt");
       }
     }
 
-    const modelSelection = resolveModelSelection(model);
-    progress.add("model_resolved", "Resolved model preference", {
-      provider: modelSelection.provider,
-      model: modelSelection.modelName,
-      cacheHit: Boolean(cachedGeneration),
-    });
+    let sanitizedCode;
+    if (cachedCode) {
+      progress.add("model_cache_reuse", "Using cached Blender code from cache");
+      sanitizedCode = cachedCode;
+    } else {
+      if (!genAI) {
+        throw new Error("Gemini provider is not configured");
+      }
+      progress.add("model_generate", "Generating Blender code with Gemini 2.5 Flash");
+      const modelClient = genAI.getGenerativeModel({ model: GEMINI_MODEL });
+      const result = await modelClient.generateContent(generationPrompt);
+      const rawOutput = extractCodeFromText(result?.response?.text?.() || "");
+      sanitizedCode = sanitizeBlenderCode(rawOutput);
+      if (shouldCache && cacheKey && sanitizedCode) {
+        cacheSet(cacheKey, { code: sanitizedCode });
+        progress.add("model_cache_store", "Stored generation result in cache");
+      }
+    }
 
-    const generateWithProvider = async (promptText, providerName, modelId) => {
-      if (cachedGeneration) {
-        const reuse = cachedGeneration;
-        cachedGeneration = null;
-        progress.add("model_cache_reuse", "Using cached generation result", {
-          provider: reuse.provider || providerName,
+    const preflightIssues = preflightValidateCode(sanitizedCode);
+    const finalProvider = "gemini";
+
+    let attempts = [];
+    let blenderResult = null;
+    let executionOk = true;
+
+    if (!dryRun) {
+      if (!blenderAvailable) {
+        executionOk = false;
+        blenderResult = {
+          status: "skipped",
+          error: "Blender addon is not connected. Please make sure Blender is running with the addon enabled.",
+        };
+      } else {
+        const recovery = await tryExecuteWithRecovery({
+          initialCode: sanitizedCode,
+          maxAttempts: Number(process.env.LLM_REPAIR_ATTEMPTS || 2),
+          sceneContext,
+          onAttempt: async (a) => progress.add("attempt", "Execution attempt", a),
         });
-        return reuse;
-      }
-
-      if (providerName === "gemini") {
-        if (!genAI) {
-          throw new Error("Gemini provider is not configured");
-        }
-        const modelIdToUse = modelId || GEMINI_MODEL;
-        const modelClient = genAI.getGenerativeModel({ model: modelIdToUse });
-        const result = await modelClient.generateContent(promptText);
-        const text = extractCodeFromText(result?.response?.text?.() || "").trim();
-        return { code: text, provider: "gemini" };
-      }
-
-      if (providerName === "groq") {
-        if (!groqClient) {
-          throw new Error("Groq provider is not configured");
-        }
-        const response = await groqClient.chat.completions.create({
-          model: modelId || GROQ_MODEL,
-          messages: [{ role: "user", content: promptText }],
-          temperature: 0.2,
-        });
-        const text = extractCodeFromText(response?.choices?.[0]?.message?.content || "").trim();
-        return { code: text, provider: "groq" };
-      }
-
-      throw new Error(`Unsupported provider: ${providerName}`);
-    };
-
-    if (abTest) {
-      progress.add("ab_test_start", "Running A/B generation test");
-      const variants = [];
-
-      const primary = await generateWithProvider(generationPrompt, modelSelection.provider, modelSelection.modelName);
-      const primaryCode = sanitizeBlenderCode(extractCodeFromText(primary.code || ""));
-      variants.push({
-        provider: primary.provider || modelSelection.provider,
-        code: primaryCode,
-        preflightIssues: preflightValidateCode(primaryCode),
-      });
-
-      const alternateProvider = modelSelection.provider === "gemini"
-        ? (groqClient ? "groq" : null)
-        : (genAI ? "gemini" : null);
-      if (alternateProvider) {
-        try {
-          const alt = await generateWithProvider(
-            generationPrompt,
-            alternateProvider,
-            alternateProvider === "gemini" ? GEMINI_MODEL : GROQ_MODEL,
-          );
-          const altCode = sanitizeBlenderCode(extractCodeFromText(alt.code || ""));
-          variants.push({
-            provider: alt.provider || alternateProvider,
-            code: altCode,
-            preflightIssues: preflightValidateCode(altCode),
-          });
-        } catch (err) {
-          progress.addError("ab_test_alt_error", "Alternate provider failed during A/B", err?.message || String(err));
+        attempts = recovery.attempts || [];
+        executionOk = recovery.ok;
+        if (recovery.ok) {
+          blenderResult = recovery.result;
+        } else {
+          throw attachProgress(new Error(recovery.error || "Execution failed"));
         }
       }
-
-      analytics.totalGenerations += 1;
-      analytics.totalDurationMs += Date.now() - startedAt;
-      analyticsRecorded = true;
-
-      progress.add("ab_test_complete", "A/B generation complete", { variantCount: variants.length });
-
-      return {
-        mode: "ab",
-        variants,
-        docSnippets,
-        conversationId: conversation.id,
-        progress: progress.steps,
-      };
-    }
-
-    const pipelineResult = await runLangGraphPipeline({
-      generationPrompt,
-      provider: modelSelection.provider,
-      modelName: modelSelection.modelName,
-      generateWithProvider,
-      sanitizeCode: sanitizeBlenderCode,
-      preflightCheck: preflightValidateCode,
-      executeInBlender: async (code) => {
-        if (!blenderAvailable) {
-          throw new Error("Blender addon is not connected. Please make sure Blender is running with the addon enabled.");
-        }
-        const response = await executeBlenderCode(code);
-        if (response && response.error) {
-          const err = new Error(response.error);
-          err.details = response;
-          throw err;
-        }
-        return response;
-      },
-      repairWithLLM: (repairPrompt, preferGroqFirst) => callLLMForCode(repairPrompt, preferGroqFirst),
-      progress,
-      maxRepairs: Number(process.env.AGENT_MAX_REPAIRS ?? process.env.LLM_REPAIR_ATTEMPTS ?? 2),
-      skipExecution: dryRun || !blenderAvailable,
-    });
-
-    if (pipelineResult.error) {
-      throw attachProgress(new Error(pipelineResult.error));
-    }
-
-    const finalProvider = pipelineResult.provider || modelSelection.provider;
-    const rawCode = pipelineResult.code || "";
-    const sanitizedCode = pipelineResult.sanitizedCode || sanitizeBlenderCode(rawCode);
-    const preflightIssues = pipelineResult.preflightIssues || preflightValidateCode(sanitizedCode);
-    const attempts = pipelineResult.attempts || [];
-    const executionOk = pipelineResult.executionOk !== false;
-
-    let blenderResult = pipelineResult.blenderResult || null;
-    if (!dryRun && !blenderAvailable) {
-      blenderResult = blenderResult || {
-        status: "skipped",
-        error: "Blender addon is not connected. Please make sure Blender is running with the addon enabled.",
-      };
-    }
-
-    if (!dryRun && blenderAvailable && !executionOk) {
-      const reason = pipelineResult.lastError || "Blender execution failed";
-      throw attachProgress(new Error(reason));
-    }
-
-    if (shouldCache && cacheKey && pipelineResult.code) {
-      cacheSet(cacheKey, { code: pipelineResult.code, provider: finalProvider });
-      progress.add("model_cache_store", "Stored generation result in cache", { provider: finalProvider });
     }
 
     analytics.totalGenerations += 1;
@@ -426,7 +357,7 @@ async function runGenerationCore(body, user) {
       let critique = "";
       try {
         const critiquePrompt = `You are reviewing Blender 4.5 Python code. Briefly list issues and propose concrete fixes. Return a short bullet list of suggestions, no code fences.\n\nCODE:\n${sanitizedCode}`;
-        const { code: reviewText } = await callLLMForCode(critiquePrompt, false);
+  const { code: reviewText } = await callLLMForCode(critiquePrompt);
         critique = reviewText;
       } catch (err) {
         progress.addError("dry_run_critique", "Failed to produce critique", err?.message || String(err));
@@ -548,54 +479,6 @@ async function runGenerationCore(body, user) {
     }
     throw attachProgress(err instanceof Error ? err : new Error(String(err)));
   }
-}
-
-function resolveModelSelection(requestedModel) {
-  const normalized = typeof requestedModel === "string" ? requestedModel.toLowerCase().trim() : "";
-
-  const prefersGroq = /groq|llama/.test(normalized);
-  const prefersGemini = /gemini|google/.test(normalized);
-
-  if (prefersGroq && groqClient) {
-    let modelName = GROQ_MODEL;
-    if (/70b/.test(normalized)) {
-      modelName = "llama3-70b-8192";
-    } else if (/8b/.test(normalized)) {
-      modelName = "llama3-8b-8192";
-    }
-    return { provider: "groq", modelName };
-  }
-
-  if (prefersGemini && genAI) {
-    const sanitized = normalized.replace(/_/g, "-");
-    const aliasMap = {
-      gemini: GEMINI_MODEL,
-      "gemini-2.0-flash": GEMINI_MODEL,
-      "gemini-2.0-flash-lite": GEMINI_MODEL,
-      "gemini-2.5-pro": GEMINI_MODEL,
-      "gemini-2.5-flash": GEMINI_MODEL,
-      "gemini-2.5-flash-lite": GEMINI_MODEL,
-    };
-    const allowedGeminiModels = new Set([
-      GEMINI_MODEL,
-      "gemini-1.5-pro",
-      "gemini-1.5-pro-latest",
-      "gemini-1.5-flash",
-      "gemini-1.5-flash-latest",
-    ]);
-    const mapped = aliasMap[sanitized] || (allowedGeminiModels.has(sanitized) ? sanitized : GEMINI_MODEL);
-    return { provider: "gemini", modelName: mapped };
-  }
-
-  if (genAI) {
-    return { provider: "gemini", modelName: GEMINI_MODEL };
-  }
-
-  if (groqClient) {
-    return { provider: "groq", modelName: GROQ_MODEL };
-  }
-
-  throw new Error("No model providers configured");
 }
 
 function summarizeText(text, maxLength = 400) {
@@ -988,40 +871,19 @@ function extractCodeFromText(text) {
   return (match ? match[1] : text.replace(/```/g, "")).trim();
 }
 
-async function callLLMForCode(promptText, preferGroqFirst = false) {
-  const order = [];
-  if (preferGroqFirst && groqClient) order.push("groq");
-  if (genAI) order.push("gemini");
-  if (groqClient && !preferGroqFirst) order.push("groq");
-
-  for (const p of order) {
-    try {
-      if (p === "gemini" && genAI) {
-        const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
-        const result = await model.generateContent(promptText);
-        const text = extractCodeFromText(result?.response?.text?.() || "");
-        if (text) return { code: text, provider: "gemini" };
-      }
-      if (p === "groq" && groqClient) {
-        const resp = await groqClient.chat.completions.create({
-          model: GROQ_MODEL,
-          messages: [{ role: "user", content: promptText }],
-          temperature: 0.2,
-        });
-        const text = extractCodeFromText(resp?.choices?.[0]?.message?.content || "");
-        if (text) return { code: text, provider: "groq" };
-      }
-    } catch (err) {
-      console.error(`❌ LLM (${p}) call failed:`, err.message);
-    }
+async function callLLMForCode(promptText) {
+  if (!genAI) {
+    throw new Error("Gemini provider is not configured");
   }
-  return { code: "", provider: "" };
+  const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
+  const result = await model.generateContent(promptText);
+  const text = extractCodeFromText(result?.response?.text?.() || "");
+  return { code: text, provider: "gemini" };
 }
 
 async function tryExecuteWithRecovery({
   initialCode,
   maxAttempts = Number(process.env.LLM_REPAIR_ATTEMPTS || 2),
-  preferGroq = false,
   sceneContext,
   onAttempt,
 }) {
@@ -1081,7 +943,7 @@ ${code}
 
 Return ONLY the fully corrected Blender Python code, ready to run now.`;
 
-      const { code: repaired } = await callLLMForCode(repairPrompt, preferGroq);
+  const { code: repaired } = await callLLMForCode(repairPrompt);
       if (!repaired) {
         // If LLM couldn't repair, stop early
         return { ok: false, error: errorMessage, code: sanitized, attempts, hints: lastHints };
@@ -1296,7 +1158,7 @@ function deriveTitleFromPrompt(prompt) {
   return normalized.length > 80 ? `${normalized.slice(0, 77)}...` : normalized;
 }
 
-const getSystemPrompt = (hasHistory, sceneContext) => {
+const getSystemPrompt = (hasHistory, sceneContext, integrationStatus = { hyper3d: false, polyhaven: false, sketchfab: false }) => {
   let basePrompt = `
 You are an expert Blender Python script generator with deep knowledge of Blender 4.5 API and 3D modeling best practices.
 Your goal is to generate accurate, production-quality Blender Python code that creates precise 3D models based on user descriptions.
@@ -1326,6 +1188,22 @@ ACCURACY GUIDELINES:
 - Use appropriate mesh primitives and modifiers for realistic results
 - Apply smooth shading for organic objects
 - Use proper rotation and positioning for objects
+`;
+
+  // Add integration status information
+  basePrompt += `
+AVAILABLE ASSET INTEGRATIONS:
+- Hyper3D Rodin: ${integrationStatus.hyper3d ? 'ENABLED - Use generate_hyper3d_model_via_text() or generate_hyper3d_model_via_images() for custom/unique items' : 'DISABLED'}
+- PolyHaven: ${integrationStatus.polyhaven ? 'ENABLED - Use download_polyhaven_asset() for generic objects, textures, and HDRIs' : 'DISABLED'}
+- Sketchfab: ${integrationStatus.sketchfab ? 'ENABLED - Use search_sketchfab_models() then download_sketchfab_model() for realistic/specific items' : 'DISABLED'}
+
+IMPORTANT: These functions (get_hyper3d_status, generate_hyper3d_model_via_text, etc.) are available as Python functions in the Blender addon.
+You can call them directly in your code. If Hyper3D is enabled, use it for high-detail, realistic models (especially animals/creatures).
+If an integration is disabled, do NOT try to use it - fall back to procedural modeling instead.
+`;
+
+  basePrompt += `
+${ASSET_CREATION_STRATEGY_PROMPT}
 `;
 
   // Few-shot examples (small, focused, high-signal)
@@ -1409,6 +1287,10 @@ const API_SNIPPETS = [
     key: "camera_set",
     text: "Set camera: cam=bpy.data.cameras.new('Cam'); obj=bpy.data.objects.new('CamObj', cam); bpy.context.scene.collection.objects.link(obj); bpy.context.scene.camera = obj",
   },
+  {
+    key: "asset_strategy_core",
+    text: "Asset creation strategy: always call get_scene_info(); check get_polyhaven_status(), get_sketchfab_status(), get_hyper3d_status(); prefer download_polyhaven_asset()/search_sketchfab_models()+download_sketchfab_model()/generate_hyper3d_model_via_text or images + poll_rodin_job_status + import_generated_asset; after import adjust via world_bounding_box, location, scale, rotation; only script primitives if integrations unavailable.",
+  },
 ];
 
 function getRelevantDocs(promptText) {
@@ -1423,6 +1305,10 @@ function getRelevantDocs(promptText) {
       (s.key === 'loopcut' && /loopcut|edge cut/.test(lower)) ||
       (s.key === 'camera_set' && /camera|render view|shot/.test(lower))
     ) {
+      picks.push(s.text);
+      continue;
+    }
+    if (s.key === 'asset_strategy_core') {
       picks.push(s.text);
     }
   }
@@ -1474,16 +1360,9 @@ Enhancement guidelines:
 Enhanced prompt:`;
 
   try {
-    if (genAI) {
-      const geminiModel = genAI.getGenerativeModel({ model: GEMINI_MODEL });
-      const result = await geminiModel.generateContent(enhancementPrompt);
-      const enhanced = (result?.response?.text?.() || "").trim();
-      return enhanced || userPrompt;
-    }
-
     if (groqClient) {
       const groqResponse = await groqClient.chat.completions.create({
-        model: GROQ_MODEL,
+        model: PROMPT_ENHANCER_MODEL,
         messages: [{ role: "user", content: enhancementPrompt }],
         temperature: 0.3,
       });
@@ -1630,26 +1509,31 @@ app.delete("/api/conversation/:conversationId", authenticate, async (req, res) =
 });
 
 app.post("/api/enhance-prompt", authenticate, async (req, res) => {
+  const rl = checkRateLimit(req.user.id);
+  if (!rl.ok) {
+    res.set('Retry-After', Math.ceil(rl.retryAfterMs / 1000));
+    return res.status(429).json({ error: "Rate limit exceeded", retryAfterMs: rl.retryAfterMs });
+  }
   try {
     const { prompt, conversationId } = req.body || {};
-    if (!prompt) {
-      return res.status(400).json({ error: "Prompt required" });
+    if (!prompt || !prompt.trim()) {
+      return res.status(400).json({ error: "Prompt is required" });
     }
 
-    let history = [];
+    let conversationHistory = [];
     if (conversationId) {
       const conversation = await getConversationForUser(req.user.id, conversationId);
-      if (!conversation) {
-        return res.status(404).json({ error: "Conversation not found" });
+      if (conversation) {
+        const messages = await getMessagesForHistory(conversation.id, 5);
+        conversationHistory = messages.filter(m => m.role !== 'system');
       }
-      history = await getMessagesForHistory(conversationId, 6);
     }
 
-    const enhanced = await enhancePrompt(prompt, history);
-    res.json({ enhanced, original: prompt });
+    const enhanced = await enhancePrompt(prompt.trim(), conversationHistory);
+    res.json({ enhancedPrompt: enhanced });
   } catch (err) {
     console.error("❌ Enhance prompt error:", err.message);
-    res.status(500).json({ error: "Prompt enhancement failed" });
+    res.status(500).json({ error: "Failed to enhance prompt", details: err.message });
   }
 });
 
@@ -1782,8 +1666,6 @@ app.get("/api/generate/stream", authenticate, async (req, res) => {
       const q = req.query || {};
       const prompt = String(q.prompt || "");
       const conversationId = q.conversationId ? String(q.conversationId) : undefined;
-      const shouldEnhance = String(q.enhancePrompt || "false").toLowerCase() === 'true';
-      const model = q.model ? String(q.model) : undefined;
       const captureScreenshot = String(q.captureScreenshot || "false").toLowerCase() === 'true';
 
       if (!prompt.trim()) { send('error', { error: 'Prompt required' }); return res.end(); }
@@ -1799,62 +1681,79 @@ app.get("/api/generate/stream", authenticate, async (req, res) => {
 
       const history = await getMessagesForHistory(conversation.id, 10);
       let sceneContext = conversation.lastSceneContext || null;
+      let integrationStatus = { hyper3d: false, polyhaven: false, sketchfab: false };
+      
       if (blenderClient && blenderConnected) {
         try { sceneContext = await sendCommandToBlender('get_scene_info', {}); } catch {}
+        
+        // Check integration status
+        try {
+          const hyper3dStatus = await sendCommandToBlender("get_hyper3d_status", {}).catch(() => ({ enabled: false }));
+          const polyhavenStatus = await sendCommandToBlender("get_polyhaven_status", {}).catch(() => ({ enabled: false }));
+          const sketchfabStatus = await sendCommandToBlender("get_sketchfab_status", {}).catch(() => ({ enabled: false }));
+          
+          integrationStatus = {
+            hyper3d: hyper3dStatus?.enabled === true,
+            polyhaven: polyhavenStatus?.enabled === true,
+            sketchfab: sketchfabStatus?.enabled === true,
+          };
+        } catch (err) {
+          // Integration check failed, use defaults
+        }
       }
 
       const nonSystemHistory = history.filter((m)=> m.role !== 'system');
-      const finalPrompt = shouldEnhance ? (await enhancePrompt(prompt, nonSystemHistory)) : prompt;
+      const finalPrompt = prompt;
       await saveMessage(conversation.id, { role: 'user', content: finalPrompt });
 
       const historyWithCurrent = [...nonSystemHistory, { role:'user', content: finalPrompt }];
-      const systemPrompt = getSystemPrompt(historyWithCurrent.length > 1, sceneContext);
+      const systemPrompt = getSystemPrompt(historyWithCurrent.length > 1, sceneContext, integrationStatus);
       const conversationContext = historyWithCurrent.slice(-6).map((m)=> `${m.role==='user'?'User':'Assistant'}: ${m.content}`).join('\n\n');
       const docSnippets = getRelevantDocs(finalPrompt);
       const base = historyWithCurrent.length>1 ? `${systemPrompt}\n\nConversation history:\n${conversationContext}\n\nCurrent user request: ${finalPrompt}` : `${systemPrompt}\n\nUser request: ${finalPrompt}`;
       const fullPrompt = docSnippets.length ? `${base}\n\nHelpful API snippets:\n${docSnippets.map((t,i)=>`${i+1}. ${t}`).join('\n')}` : base;
       send('status', { stage:'prompt_ready' });
 
-      let providerUsed = '';
-      let code = '';
+      const providerUsed = 'gemini';
       const cacheKey = cacheKeyFromPrompt(fullPrompt);
+      let sanitizedCode = null;
       const cached = cacheGet(cacheKey);
-      if (cached?.code) { code = cached.code; providerUsed = cached.provider || ''; send('cache', { hit:true, provider: providerUsed }); }
-      else {
-        send('cache', { hit:false });
-        const order = [];
-        const rm = typeof model === 'string' ? model.toLowerCase() : '';
-        const preferGroq = rm.includes('llama') || rm.includes('groq');
-        if (preferGroq && groqClient) order.push('groq');
-        if (genAI) order.push('gemini');
-        if (groqClient && !preferGroq) order.push('groq');
-        for (const p of order) {
-          try {
-            if (p==='gemini' && genAI) {
-              const m = genAI.getGenerativeModel({ model: GEMINI_MODEL });
-              const r = await m.generateContent(fullPrompt);
-              code = (r?.response?.text?.() || '').trim();
-              if (code) { providerUsed='gemini'; break; }
-            }
-            if (p==='groq' && groqClient) {
-              const r = await groqClient.chat.completions.create({ model: GROQ_MODEL, messages:[{ role:'user', content: fullPrompt }], temperature: 0.2 });
-              code = (r?.choices?.[0]?.message?.content || '').trim();
-              if (code) { providerUsed='groq'; break; }
-            }
-          } catch (e) { send('model_error', { provider: p, message: e.message }); }
+      if (cached?.code) {
+        sanitizedCode = cached.code;
+        send('cache', { hit: true });
+      } else {
+        send('cache', { hit: false });
+        if (!genAI) {
+          send('error', { error: 'Gemini provider not configured' });
+          return res.end();
         }
-        cacheSet(cacheKey, { code, provider: providerUsed });
+        try {
+          const modelClient = genAI.getGenerativeModel({ model: GEMINI_MODEL });
+          const generation = await modelClient.generateContent(fullPrompt);
+          const rawOutput = extractCodeFromText(generation?.response?.text?.() || "");
+          sanitizedCode = sanitizeBlenderCode(rawOutput);
+          cacheSet(cacheKey, { code: sanitizedCode });
+        } catch (err) {
+          send('error', { error: err.message || 'Generation failed' });
+          return res.end();
+        }
       }
 
-      if (!code) { send('error', { error:'No model output' }); return res.end(); }
-      code = extractCodeFromText(code);
-      if (!code.includes('import bpy')) code = `import bpy\n${code}`;
-      code = sanitizeBlenderCode(code);
-      send('preflight', { issues: preflightValidateCode(code) });
+      if (!sanitizedCode) {
+        send('error', { error: 'No model output' });
+        return res.end();
+      }
 
-      const onAttempt = async (a)=> send('attempt', a);
-      send('status', { stage:'executing' });
-      const recovery = await tryExecuteWithRecovery({ initialCode: code, maxAttempts: Number(process.env.LLM_REPAIR_ATTEMPTS||2), preferGroq: providerUsed==='groq', sceneContext, onAttempt });
+      send('preflight', { issues: preflightValidateCode(sanitizedCode) });
+
+      const onAttempt = async (a) => send('attempt', a);
+      send('status', { stage: 'executing' });
+      const recovery = await tryExecuteWithRecovery({
+        initialCode: sanitizedCode,
+        maxAttempts: Number(process.env.LLM_REPAIR_ATTEMPTS || 2),
+        sceneContext,
+        onAttempt,
+      });
       if (!recovery.ok) { send('final', { ok:false, error: recovery.error, attempts: recovery.attempts||[] }); return res.end(); }
 
       let screenshot = null;
@@ -1951,11 +1850,27 @@ app.post("/api/generate", authenticate, async (req, res) => {
 
 async function startServer() {
   try {
+    console.log("📊 Initializing database schema...");
     await initSchema();
+    console.log("✅ Database schema initialized");
+  } catch (err) {
+    console.error("❌ Database initialization failed:", err.message);
+    if (err.message.includes("ENOTFOUND") || err.message.includes("getaddrinfo")) {
+      console.error("💡 This is a DNS/network error. Possible causes:");
+      console.error("   1. Check your DATABASE_URL in .env file");
+      console.error("   2. Verify your internet connection");
+      console.error("   3. Check if Supabase/database server is accessible");
+      console.error("   4. Verify the database hostname is correct");
+    }
+    console.error("❌ Backend cannot start without database connection (required for authentication)");
+    process.exit(1);
+  }
+  
+  try {
     connectToBlenderTCP();
-app.listen(PORT, () => {
-  console.log(`🚀 Backend running at http://localhost:${PORT}`);
-});
+    app.listen(PORT, () => {
+      console.log(`🚀 Backend running at http://localhost:${PORT}`);
+    });
   } catch (err) {
     console.error("❌ Failed to start backend:", err.message);
     process.exit(1);
@@ -1963,4 +1878,18 @@ app.listen(PORT, () => {
 }
 
 startServer();
+
+// Models catalog endpoint for the UI
+app.get("/api/models", authenticate, async (req, res) => {
+  try {
+    res.json({
+      gemini: [GEMINI_MODEL],
+      defaults: { gemini: GEMINI_MODEL },
+      promptEnhancer: groqClient ? PROMPT_ENHANCER_MODEL : null,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to load models", details: err?.message || String(err) });
+  }
+});
+
 
