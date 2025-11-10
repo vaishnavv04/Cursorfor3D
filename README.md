@@ -94,7 +94,8 @@ CursorFor3D revolutionizes 3D content creation by combining the power of AI with
 2. **Start the frontend**
    ```bash
    cd ../frontend
-   npm run dev
+   npm run build
+   npm start
    ```
 
 3. **Launch Blender**
