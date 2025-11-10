@@ -19,6 +19,9 @@ const pool = new Pool({
         rejectUnauthorized: false,
       }
     : undefined,
+  connectionTimeoutMillis: 10000, // 10 second timeout
+  idleTimeoutMillis: 30000,
+  max: 20,
 });
 
 function mapConversation(row) {
@@ -46,7 +49,13 @@ function mapMessage(row) {
 }
 
 async function initSchema() {
-  const client = await pool.connect();
+  let client;
+  try {
+    client = await pool.connect();
+  } catch (err) {
+    throw new Error(`Database connection failed: ${err.message}. Please check your DATABASE_URL and network connectivity.`);
+  }
+  
   try {
     await client.query("CREATE EXTENSION IF NOT EXISTS pgcrypto;");
 
@@ -92,7 +101,9 @@ async function initSchema() {
       "CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages (conversation_id, created_at ASC);"
     );
   } finally {
-    client.release();
+    if (client) {
+      client.release();
+    }
   }
 }
 

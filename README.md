@@ -1,103 +1,176 @@
-CursorFor3D
-===========
+# 🔌 CursorFor3D - AI-Powered 3D Modeling Assistant
 
-CursorFor3D is an experimental desktop workflow that connects an Electron + React UI, a Node.js backend, Google Gemini, and the Blender MCP (Model Context Protocol) add-on. The goal is to let artists describe a scene in natural language, optionally include a reference image, and have the AI build the corresponding 3D model directly inside Blender.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) [![Version](https://img.shields.io/badge/version-1.2.0-blue)](https://github.com/yourusername/CursorFor3D/releases)
 
-## 🎯 Features
+CursorFor3D revolutionizes 3D content creation by combining the power of AI with professional 3D modeling. This desktop application allows artists and designers to create complex 3D models and scenes using natural language descriptions, while intelligently leveraging multiple generation methods for optimal results.
 
-- **Continuous Chat Interface**: Have back-and-forth conversations to refine your 3D models iteratively
-- **Dark UI**: Sleek, modern dark-themed interface for a premium user experience
-- **Enhanced LLM Accuracy**: Improved prompts and context awareness for better model generation
-- **Prompt Enhancement**: Automatically enhances user prompts for more detailed and accurate results
-- **Conversation History**: Maintains context across multiple interactions
-- **Scene Context Awareness**: Tracks current Blender scene state for intelligent modifications
-- **Multi-Agent Repair Pipeline**: LangGraph orchestrated agents auto-repair Blender errors before returning results
+## 💯 Key Features
+
+### 🔍 AI-Powered 3D Generation
+- **Natural Language to 3D**: Convert text descriptions into detailed 3D models
+- **Multi-Source Generation**: Automatically selects the best approach from:
+  - **Hyper3D/Rodin**: For high-quality, detailed models
+  - **Sketchfab Integration**: Access to thousands of pre-made 3D assets
+  - **PolyHaven Assets**: High-quality HDRIs, textures, and models
+  - **Procedural Generation**: Custom Blender Python code when needed
+
+### ⚙️ Advanced Features
+- **Intelligent Asset Pipeline**: Automatically sources and integrates 3D assets
+- **Hybrid Workflow**: Seamlessly combines AI generation with manual refinement
+- **Context-Aware Modeling**: Maintains scene context and spatial relationships
+- **Error Recovery**: Multi-agent system for automatic error detection and repair
+- **Progress Visualization**: Real-time feedback on generation progress
+
+### 💻 Technical Highlights
+- **Blender MCP Integration**: Direct communication with Blender's Model Context Protocol
+- **Dual-LLM Architecture**: 
+  - **Gemini 2.5 Flash**: Main model for Blender code generation and scene understanding
+  - **Groq llama-3.1-8b-instant**: Dedicated prompt enhancement for better generation quality
+- **Responsive UI**: Built with Electron + React and Tailwind CSS
+- **Modular Architecture**: Easy to extend with new generation methods and integrations
 - **Step-by-Step Progress Feed**: Backend emits structured timeline events for frontend progress visualizations
 
-Project Structure
------------------
+## 🚀 Quick Start
 
+### Prerequisites
+
+- **Blender 4.5+** with the MCP add-on enabled on port 9876
+- **Node.js 20+**
+- **Google Gemini API key** (required for main code generation)
+- **Groq API key** (required for prompt enhancement using llama-3.1-8b-instant)
+- **PostgreSQL** (or Supabase) for data persistence
+- (Optional) **Sketchfab API key** for 3D model access
+
+### Installation
+
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/yourusername/CursorFor3D.git
+   cd CursorFor3D
+   ```
+
+2. **Set up environment variables**
+   Create a `.env` file in the `backend` directory:
+   ```env
+   # Required
+   JWT_SECRET=your_secure_jwt_secret
+   DATABASE_URL=postgres://user:password@localhost:5432/cursor3d
+   GEMINI_API_KEY=your_gemini_api_key
+   GROQ_API_KEY=your_groq_api_key
+   
+   # Optional
+   SKETCHFAB_API_KEY=your_sketchfab_key
+   
+   # Server Configuration
+   PORT=5000
+   BLENDER_TCP_HOST=127.0.0.1
+   BLENDER_TCP_PORT=9876
+   ```
+
+3. **Install dependencies**
+   ```bash
+   # Install backend dependencies
+   cd backend
+   npm install
+   
+   # Install frontend dependencies
+   cd ../frontend
+   npm install
+   ```
+
+4. **Set up Blender**
+   - Install the MCP add-on in Blender
+   - Configure it to listen on port 9876
+   - Start the MCP server in Blender
+
+### Running the Application
+
+1. **Start the backend server**
+   ```bash
+   cd backend
+   npm start
+   ```
+
+2. **Start the frontend**
+   ```bash
+   cd ../frontend
+   npm run dev
+   ```
+
+3. **Launch Blender**
+   - Make sure the MCP add-on is enabled and running
+   - The application will automatically connect to Blender
+
+## 🎨 Features in Depth
+
+### Smart Asset Generation
+- **Automatic Source Selection**: Chooses the best generation method based on content type
+- **Hyper3D Integration**: For photorealistic, high-detail models
+- **Asset Library Access**: Direct integration with Sketchfab and PolyHaven
+- **Procedural Generation**: Gemini 2.5 Flash generates Blender Python code for custom models
+
+### Dual-Model AI Architecture
+- **Gemini 2.5 Flash**: Handles all Blender code generation, scene understanding, and error recovery
+- **Groq llama-3.1-8b-instant**: Enhances user prompts with technical details for better generation quality
+- **Smart Caching**: Reduces API calls by caching generated code
+- **Automatic Error Recovery**: Multi-attempt execution with LLM-powered code repair
+
+### Advanced Workflow
+- **Context-Aware Modeling**: Maintains scene state and object relationships
+- **Multi-Stage Generation**: Breaks complex tasks into manageable steps
+- **Error Recovery**: Automatically detects and fixes common issues
+- **Version Control Integration**: Tracks changes and allows for easy rollback
+
+### User Experience
+- **Interactive Chat**: Natural language interface for model generation
+- **Real-time Preview**: See changes in Blender as they happen
+- **History & Versioning**: Access previous generations and modifications
+- **Customizable Presets**: Save and reuse generation settings
+
+## 📚 Documentation
+
+### Project Structure
 ```
 CursorFor3D/
-├── backend/         # Node.js API server + Gemini bridge
-├── frontend/        # React app rendered inside Electron
-└── README.md
+├── backend/               # Node.js API server
+│   ├── agents/           # AI agents and workflows
+│   ├── utils/            # Utility functions
+│   └── server.js         # Main server file
+├── frontend/             # React + Electron app
+│   ├── public/           # Static assets
+│   └── src/              # React components
+├── docs/                 # Documentation
+└── README.md             # This file
 ```
 
-Prerequisites
--------------
+### API Reference
 
-- Blender 4.5+ with the MCP add-on enabled on port 9876
-- Node.js 20+
-- A Google Gemini API key (Gemini 2.5 Flash or newer)
-- (Optional) A Groq API key if you want automatic fallback when Gemini rate limits
-- (Optional) Python virtual environment for the MCP add-on if you tweak it locally
-- PostgreSQL database (or hosted equivalent like Supabase) for auth and chat persistence
+#### Key Endpoints
+- `POST /api/generate` - Generate 3D content from text
+- `GET /api/scene` - Get current scene information
+- `POST /api/execute` - Execute Blender Python code
+- `GET /api/history` - Get generation history
 
-1. Configure Environment
-------------------------
+## 🤝 Contributing
 
-1. In `backend/`, create a `.env` file (or copy from `.env.example` if present) and set:
-	```
-		# Required for auth and persistence
-		JWT_SECRET=replace_with_strong_random_string
-		DATABASE_URL=postgres://user:password@host:5432/dbname
+We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
 
-		# LLM providers
-		GEMINI_API_KEY=your_gemini_key
-		GROQ_API_KEY=your_groq_key # optional fallback provider
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/AmazingFeature`)
+3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to the branch (`git push origin feature/AmazingFeature`)
+5. Open a Pull Request
 
-		# Server ports
-		PORT=5000                    # backend HTTP port
-		BLENDER_TCP_HOST=127.0.0.1   # where Blender MCP listens
-		BLENDER_TCP_PORT=9876        # Blender MCP TCP port
+## 📄 License
 
-	```
-2. Launch Blender, enable the MCP panel, and start the server so it listens on TCP port 9876.
-3. Ensure your PostgreSQL instance is reachable from the backend. Supabase works out-of-the-box; SSL is auto-enabled when `DATABASE_URL` contains "supabase".
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-2. Install Dependencies
------------------------
+## 🙏 Acknowledgments
 
-From the repo root:
-
-```powershell
-cd backend
-npm install
-
-cd ..\frontend
-npm install
-```
-
-3. Run the Stack
-----------------
-
-1. **Backend**
-	```powershell
-	cd backend
-	npm start
-	```
-	The server listens on `http://localhost:5000` (configurable via `PORT`) and maintains a TCP connection to Blender MCP.
-
-2. **Frontend + Electron shell**
-	```powershell
-	cd frontend
-	npm run dev
-	```
-	This starts the React dev server on `http://localhost:3000` and launches the Electron window.
-
-Generation Pipeline & Progress Telemetry
-----------------------------------------
-
-- The backend now routes generations through a LangGraph workflow (`backend/agents/langgraphPipeline.js`) that manages prompt creation, preflight checks, Blender execution, and automatic repair attempts.
-- Each request builds a structured timeline via `backend/utils/progress.js`. The array is returned in every `/api/generate` response and saved on the assistant message for UI playback.
-- Dry-run and A/B flows skip execution but still record model/validation steps for consistent progress display.
-- Model selection gracefully handles Gemini aliases (e.g. `gemini-2.5-pro`) by mapping them to supported model IDs before calling the provider.
-
-Usage
------
-
-1. Open the Electron window or navigate to the generator page in your browser.
+- Blender Foundation for the amazing 3D creation suite
+- Google for Gemini 2.5 Flash AI model powering code generation
+- Groq for fast prompt enhancement with llama-3.1-8b-instant
+- The open-source community for countless libraries and tools
 2. Start a conversation by describing what you want to create.
 3. Refine your model through continuous chat - ask for modifications, improvements, or changes.
 4. Enable prompt enhancement for more detailed and accurate results.
@@ -107,7 +180,9 @@ Troubleshooting
 ---------------
 
 - **No response from Blender**: check the backend console for messages such as "Blender MCP not connected". Make sure the MCP panel is running on port 9876.
-- **Gemini errors**: verify your `GEMINI_API_KEY` and the model name in `backend/server.js`.
+- **Gemini errors**: verify your `GEMINI_API_KEY` is valid. The system uses Gemini 2.5 Flash exclusively for code generation.
+- **Groq errors**: verify your `GROQ_API_KEY` is valid. Groq is used for prompt enhancement with llama-3.1-8b-instant model.
+- **"get_hyper3d_status is not defined" errors**: The generated code attempted to call integration functions directly in Blender. This is a known issue being addressed - the code should use the socket API instead.
 - **Electron window blank**: wait for the React dev server to finish compiling or restart with `npm run dev`.
 - **Backend exits on start**: ensure `JWT_SECRET` and `DATABASE_URL` are set. The backend will terminate if `JWT_SECRET` is missing, and will throw if no database connection string is provided.
 - **Database connection errors**: confirm `DATABASE_URL` is valid and reachable. For Supabase, SSL is enabled automatically; for self-hosted Postgres, provide a standard connection string.

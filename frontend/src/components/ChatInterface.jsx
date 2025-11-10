@@ -24,12 +24,13 @@ const ChatInterface = () => {
   const [messagesLoading, setMessagesLoading] = useState(false);
   const [sidebarError, setSidebarError] = useState("");
   const [error, setError] = useState("");
-  const [enhancePrompt, setEnhancePrompt] = useState(true);
   const [showEnhanced, setShowEnhanced] = useState(false);
   const [enhancedPromptText, setEnhancedPromptText] = useState("");
   const [attachments, setAttachments] = useState([]);
   const [progress, setProgress] = useState([]);
-  const [selectedModel, setSelectedModel] = useState("gemini-2.5-flash");
+  // Hardcoded to use gemini-2.5-flash as the only model
+  const selectedModel = "gemini:gemini-2.5-flash";
+  const [enhancing, setEnhancing] = useState(false);
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
   const [collapsed, setCollapsed] = useState(false);
@@ -81,11 +82,12 @@ const ChatInterface = () => {
     [baseUrl, token, logout]
   );
 
+  // No need to fetch models from backend as we're using a single hardcoded model
+
   const handleRename = useCallback(async (chatId, newName) => {
     if (!newName || !newName.trim()) {
       setEditingChatId(null);
       setEditedName("");
-      return;
     }
     
     const trimmedName = newName.trim();
@@ -290,47 +292,36 @@ const handleNewChat = useCallback(async () => {
 
 
 
-  const handleEnhancePrompt = useCallback(
-    async (promptText, convId) => {
-      if (!promptText.trim()) return promptText;
-      try {
-        const res = await authorizedFetch("/api/enhance-prompt", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ prompt: promptText, conversationId: convId || conversationId }),
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data.error || "Enhancement failed");
-        }
-        if (data.enhanced && data.enhanced !== promptText) {
-          setEnhancedPromptText(data.enhanced);
-          setShowEnhanced(true);
-          return data.enhanced;
-        }
-      } catch (err) {
-        console.error("Failed to enhance prompt", err);
+  const handleEnhancePrompt = useCallback(async () => {
+    if (!input.trim() || enhancing || loading) return;
+    
+    setEnhancing(true);
+    setError("");
+    try {
+      const res = await authorizedFetch("/api/enhance-prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: input.trim(), conversationId }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Enhancement failed");
       }
-      return promptText;
-    },
-    [authorizedFetch, conversationId]
-  );
+      if (data.enhancedPrompt && data.enhancedPrompt.trim()) {
+        setInput(data.enhancedPrompt.trim());
+        inputRef.current?.focus();
+      }
+    } catch (err) {
+      console.error("Failed to enhance prompt", err);
+      setError(err.message || "Failed to enhance prompt");
+    } finally {
+      setEnhancing(false);
+    }
+  }, [authorizedFetch, conversationId, input, enhancing, loading]);
 
   const handleSend = useCallback(async () => {
     // Allow sending if there's text OR attachments
     if ((!input.trim() && attachments.length === 0) || loading) return;
-
-    // Warn if using Groq with images (Groq doesn't support vision)
-    if (attachments.length > 0 && (selectedModel.includes("llama") || selectedModel.includes("groq"))) {
-      const useGemini = window.confirm(
-        "You've uploaded images, but Groq doesn't support image analysis.\n\n" +
-        "Would you like to switch to Gemini 2.5 Flash for image analysis?\n\n" +
-        "Click OK to use Gemini, or Cancel to continue with Groq (images will be ignored)."
-      );
-      if (useGemini) {
-        setSelectedModel("gemini-2.5-flash");
-      }
-    }
 
     const rawPrompt = input.trim();
     setInput("");
@@ -366,9 +357,6 @@ const handleNewChat = useCallback(async () => {
       }
 
       let finalPrompt = effectivePrompt;
-      if (enhancePrompt) {
-        finalPrompt = await handleEnhancePrompt(effectivePrompt, activeConversationId);
-      }
 
       // Verify attachments have dataUrl before sending
       const payloadAttachments = attachments.map(({ id, name, type, dataUrl, size }) => {
@@ -400,7 +388,7 @@ const handleNewChat = useCallback(async () => {
         body: JSON.stringify({
           prompt: effectivePrompt,
           conversationId: activeConversationId,
-          enhancePrompt,
+          enhancePrompt: false,
           model: selectedModel,
           attachments: payloadAttachments,
         }),
@@ -447,9 +435,7 @@ const handleNewChat = useCallback(async () => {
     conversationId,
     createConversation,
     deriveTitleFromPrompt,
-    enhancePrompt,
     fetchConversations,
-    handleEnhancePrompt,
     input,
     loading,
     normalizeMessage,
@@ -741,25 +727,8 @@ const handleNewChat = useCallback(async () => {
               {conversationId ? "Active" : "New Chat"}
             </span>
           </div>
-          <div className="flex items-center gap-4">
-            <label className="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={enhancePrompt}
-                onChange={(e) => setEnhancePrompt(e.target.checked)}
-                className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-blue-500 focus:ring-blue-500"
-              />
-              <span>Enhance</span>
-            </label>
-            <select
-              value={selectedModel}
-              onChange={(e) => setSelectedModel(e.target.value)}
-              className="bg-gray-900/70 border border-gray-800 rounded-lg px-3 py-1.5 text-xs focus:outline-none"
-            >
-              <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
-              <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
-              <option value="llama3-70b-8192">Groq LLaMA3 70B</option>
-            </select>
+          <div className="text-xs text-gray-400">
+            Model: gemini-2.5-flash
           </div>
         </div>
 
@@ -1006,9 +975,25 @@ const handleNewChat = useCallback(async () => {
                   onKeyPress={handleKeyPress}
                   placeholder="Describe what you want to create..."
                   rows={1}
-                  className="w-full px-4 py-3 pr-24 rounded-xl bg-gray-900/80 border border-gray-800 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-pink-600/40 focus:border-pink-600/40 resize-none max-h-32 overflow-y-auto"
+                  className="w-full px-4 py-3 pr-32 rounded-xl bg-gray-900/80 border border-gray-800 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-pink-600/40 focus:border-pink-600/40 resize-none max-h-32 overflow-y-auto"
                   style={{ minHeight: "48px" }}
                 />
+                <button
+                  onClick={handleEnhancePrompt}
+                  disabled={!input.trim() || enhancing || loading}
+                  className="absolute right-24 bottom-2 p-2 rounded-lg bg-gray-800 hover:bg-gray-700 disabled:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-50 transition-colors"
+                  title="Enhance prompt"
+                >
+                  {enhancing ? (
+                    <svg className="w-5 h-5 text-gray-200 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg>
+                  ) : (
+                    <svg className="w-5 h-5 text-gray-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                    </svg>
+                  )}
+                </button>
                 <label 
                   className="absolute right-12 bottom-2 p-2 rounded-lg bg-gray-800 hover:bg-gray-700 cursor-pointer transition-colors"
                   title="Upload images or PDFs"
