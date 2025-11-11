@@ -11,6 +11,7 @@ import Groq from "groq-sdk";
 import { pool, initSchema, mapConversation, mapMessage } from "./db.js";
 // import { runLangGraphPipeline } from "./agents/langgraphPipeline.js";
 import { createProgressTracker } from "./utils/progress.js";
+import { getHyper3DPromptContext } from "./utils/hyper3dPrompt.js";
 
 dotenv.config();
 
@@ -32,32 +33,24 @@ const genAI = process.env.GEMINI_API_KEY
   ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
   : null;
 const groqClient = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
-const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const PROMPT_ENHANCER_MODEL = "llama-3.1-8b-instant";
 
-const ASSET_CREATION_STRATEGY_PROMPT = `
-ASSET CREATION STRATEGY (MANDATORY):
-1. Always start by calling get_scene_info() to understand the current scene.
-2. For each asset you need, check integration status in this order and prefer assets over manual modeling:
-   a. Call get_polyhaven_status(), get_sketchfab_status(), and get_hyper3d_status() to know what is available.
-   b. If PolyHaven is enabled:
-      - Use download_polyhaven_asset(asset_type="models") for generic objects/furniture.
-      - Use download_polyhaven_asset(asset_type="textures") for materials.
-      - Use download_polyhaven_asset(asset_type="hdris") for environment lighting.
-   c. If Sketchfab is enabled (best for realistic/specific items):
-      - Use search_sketchfab_models(query) then download_sketchfab_model(uid) for downloadable models.
-   d. If Hyper3D is enabled (best for unique/custom items):
-      - Use generate_hyper3d_model_via_images() when images are provided.
-      - Otherwise use generate_hyper3d_model_via_text().
-      - Poll with poll_rodin_job_status() until complete, import via import_generated_asset().
-      - If free trial key is exhausted, tell the user the suggested next steps (wait, get API key, or fal.ai key) and fall back to next integration.
-3. After an asset is imported from any source:
-   - Get its world_bounding_box.
-   - Adjust location, scale, and rotation so it sits correctly in the scene, with no clipping.
-   - Ensure spatial relationships are correct relative to other objects.
-4. Only fall back to procedural Blender Python modeling when ALL integrations are unavailable or unsuitable, or when the user explicitly requests primitives/basic materials.
-5. For multiple assets, repeat the checks per asset and keep the scene consistent.
-6. Never attempt to generate ground or entire scenes with Hyper3D; it is for single objects only.
+/**
+ * NEW: This is the rectified strategy.
+ * It tells the LLM its *new* role: refining assets, not importing them.
+ */
+const RECTIFIED_ASSET_STRATEGY_PROMPT = `
+ASSET REFINEMENT STRATEGY:
+1. Your primary goal is to generate procedural bpy code.
+2. HOWEVER, if the user's request mentions an object that was "just imported" (e.g., "A new asset named 'Dragon.001' was just imported..."), your task is to generate refinement code.
+3. For REFINEMENT, your code MUST:
+    a. Select the object by its name (e.g., bpy.data.objects.get("Dragon.001")).
+    b. Make it the active object.
+    c. Use its '.bound_box' or '.dimensions' to check its size.
+    d. Scale it appropriately (e.g., to 2.0 meters on its largest axis).
+    e. Move it to the correct location (e.g., so its base is at Z=0).
+4. Do NOT call any import functions like 'download_polyhaven_asset' or 'create_rodin_job'. The server handles this. You ONLY write 'bpy' code.
 `;
 
 // Simple LRU cache for code generation results (prompt -> code)
@@ -144,6 +137,110 @@ async function processJobQueue() {
   }
 }
 
+/**
+ * FIXED: Polls for Hyper3D job completion
+ * This logic is now correct based on addon.py and our tests.
+ */
+async function pollHyper3DJob(subscriptionKey, progress) {
+  const POLL_INTERVAL_MS = 5000;
+  const JOB_TIMEOUT_MS = 180000; // 3 minutes
+  const startTime = Date.now();
+
+  progress.add("hyper3d_poll_start", "Polling Hyper3D job", { subKey: subscriptionKey.slice(0, 10) + "..." });
+
+  while (Date.now() - startTime < JOB_TIMEOUT_MS) {
+    try {
+      const statusRes = await sendCommandToBlender("poll_rodin_job_status", { subscription_key: subscriptionKey });
+      
+      if (statusRes.status_list) {
+        // This is for MAIN_SITE mode
+        // Check for 'Done' as per our successful test
+        if (statusRes.status_list.every(s => s === 'Done')) { 
+          progress.merge("hyper3d_poll_start", { message: "Hyper3D job succeeded" });
+          return; // Success, just return
+        }
+        
+        if (statusRes.status_list.some(s => s === 'failed')) {
+          throw new Error("Hyper3D job failed (one or more tasks failed)");
+        }
+        
+        progress.add("hyper3d_poll_wait", "Hyper3D job running...", { currentStatus: statusRes.status_list.join(', ') });
+      
+      } else if (statusRes.status === 'succeeded') { 
+        // This is for FAL_AI mode
+        progress.merge("hyper3d_poll_start", { message: "Hyper3D job (fal.ai) succeeded", data: statusRes.result });
+        return statusRes.result; // fal.ai returns result
+      
+      } else if (statusRes.status === 'failed') {
+        throw new Error(statusRes.error || "Hyper3D job failed");
+      
+      } else {
+        // Other fal.ai statuses like 'running' or 'pending'
+        progress.add("hyper3d_poll_wait", "Hyper3D job running...", { currentStatus: statusRes.status });
+      }
+
+      await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
+
+    } catch (err) {
+      progress.addError("hyper3d_poll_error", "Polling failed", err.message);
+      throw err; // Re-throw to be caught by the orchestrator
+    }
+  }
+
+  throw new Error("Hyper3D job timed out after 3 minutes");
+}
+
+
+/**
+ * HELPER: Detects asset integration intent from prompt.
+ */
+function detectAssetIntent(promptText, integrationStatus) {
+  const p = promptText.toLowerCase().trim();
+  
+  // Use broader keywords for Hyper3D as per our tests
+  const hyper3dKeywords = ['realistic', 'photorealistic', 'hyper3d', 'rodin', 'dragon', 'creature', 'monster', 'sculpture', 'animal', 'high detail'];
+  const sketchfabKeywords = ['sketchfab', 'specific model', 'brand name', 'realistic car', 'eames chair', 'starship'];
+  const polyhavenKeywords = ['polyhaven', 'texture', 'hdri', 'material', 'generic', 'simple chair', 'basic furniture', 'wooden chair', 'table'];
+
+  // Prioritize Hyper3D if enabled and keywords match
+  if (integrationStatus.hyper3d && hyper3dKeywords.some(k => p.includes(k))) {
+    return {
+      type: 'hyper3d',
+      prompt: promptText, // Use the full prompt for Hyper3D
+    };
+  }
+
+  // Check Sketchfab
+  if (integrationStatus.sketchfab && sketchfabKeywords.some(k => p.includes(k))) {
+    // Extract a query (this is very basic)
+    const query = p.replace('sketchfab', '').replace('add', '').trim();
+    return {
+      type: 'sketchfab',
+      query: query || 'realistic model',
+    };
+  }
+  
+  // Check PolyHaven (often for textures/HDRIs, but also models)
+  if (integrationStatus.polyhaven) {
+    if (p.includes('hdri') || p.includes('sky texture')) {
+      const query = p.replace('hdri', '').replace('sky texture','').trim();
+      return { type: 'polyhaven', asset_type: 'hdris', query: query || 'sky' };
+    }
+    if (p.includes('texture') || p.includes('material')) {
+      const query = p.replace('texture', '').replace('material','').trim();
+      return { type: 'polyhaven', asset_type: 'textures', query: query || 'wood' };
+    }
+    if (polyhavenKeywords.some(k => p.includes(k))) {
+      const query = p.replace('polyhaven', '').trim();
+      return { type: 'polyhaven', asset_type: 'models', query: query || p }; // Use the whole prompt as query
+    }
+  }
+
+  // Default: no asset integration, just generate code
+  return { type: 'none' };
+}
+
+
 // Core generation logic used by queue; mirrors /api/generate with minimal fields
 async function runGenerationCore(body, user) {
   const {
@@ -179,6 +276,10 @@ async function runGenerationCore(body, user) {
     if (!rawPrompt) {
       throw attachProgress(new Error("Prompt required"));
     }
+    
+    // This will be the prompt we send to the LLM.
+    // It may be modified by the orchestration logic below.
+    let generationInputPrompt = rawPrompt;
 
     let conversation;
     if (conversationId) {
@@ -240,9 +341,146 @@ async function runGenerationCore(body, user) {
       });
     }
 
-    const nonSystemHistory = history.filter((msg) => msg.role !== "system");
-    let finalPrompt = rawPrompt; // Prompt enhancement disabled
+    // --- FULLY CORRECTED ORCHESTRATION LOGIC ---
+    let preflightAsset = null;
+    if (blenderAvailable && !dryRun) {
+      const assetIntent = detectAssetIntent(rawPrompt, integrationStatus);
+      
+      try {
+        if (assetIntent.type === 'hyper3d') {
+          progress.add("orchestrate_hyper3d", "Hyper3D intent detected", { prompt: assetIntent.prompt });
+          
+          // Step 2: Trigger Job (sends 'text_prompt')
+          const job = await sendCommandToBlender("create_rodin_job", { text_prompt: assetIntent.prompt });
+          
+          // Step 2b: Parse response (gets 'uuid' and 'jobs.subscription_key')
+          const subscriptionKey = job.jobs?.subscription_key;
+          const taskUuid = job.uuid;
 
+          if (!subscriptionKey || !taskUuid) {
+              throw new Error(`Addon did not return 'jobs.subscription_key' or 'uuid'. Response: ${JSON.stringify(job)}`);
+          }
+          progress.merge("orchestrate_hyper3d", { message: "Job submitted", taskUuid, subKey: subscriptionKey.slice(0, 10) + "..." });
+
+          // Step 3: Poll for completion (sends 'subscription_key', checks for 'Done')
+          await pollHyper3DJob(subscriptionKey, progress);
+          
+          // Step 4: Import asset (sends 'task_uuid' and 'name')
+          const importResult = await sendCommandToBlender("import_generated_asset", { 
+              task_uuid: taskUuid, 
+              name: rawPrompt // Use the original prompt as the asset name
+          });
+
+          if (!importResult.succeed || !importResult.name) {
+              throw new Error(`Failed to import asset: ${importResult.error || JSON.stringify(importResult)}`);
+          }
+          
+          preflightAsset = { name: importResult.name, type: 'Hyper3D', assetType: 'models' };
+          progress.add("orchestrate_hyper3d_complete", { message: "Hyper3D asset imported", object: importResult.name });
+        
+        } else if (assetIntent.type === 'sketchfab') {
+          progress.add("orchestrate_sketchfab", "Sketchfab intent detected", { query: assetIntent.query });
+          const searchResult = await sendCommandToBlender("search_sketchfab_models", { query: assetIntent.query });
+          const firstHit = searchResult?.results?.[0]; 
+          
+          if (firstHit?.uid) {
+            progress.merge("orchestrate_sketchfab", { message: "Found model, downloading", uid: firstHit.uid });
+            const importResult = await sendCommandToBlender("download_sketchfab_model", { uid: firstHit.uid });
+            
+            if (!importResult.success || !importResult.imported_objects || importResult.imported_objects.length === 0) {
+               throw new Error(`Failed to import Sketchfab model: ${importResult.error || 'No objects imported'}`);
+            }
+            
+            const objectName = importResult.imported_objects[0]; // Use the first imported object name
+            preflightAsset = { name: objectName, type: 'Sketchfab', assetType: 'models' };
+            progress.merge("orchestrate_sketchfab", { message: "Sketchfab asset imported", object: objectName });
+          } else {
+            progress.addError("orchestrate_sketchfab", "No Sketchfab models found for query", { query: assetIntent.query });
+          }
+
+        } else if (assetIntent.type === 'polyhaven') {
+          progress.add("orchestrate_polyhaven", "PolyHaven intent detected", assetIntent);
+
+          // Build the category string (e.g., "wooden,chair")
+          const stopWords = ['a', 'an', 'the', 'of', 'for', 'with', 'and'];
+          const keywords = (assetIntent.query || rawPrompt).split(' ')
+                                      .map(w => w.toLowerCase())
+                                      .filter(w => !stopWords.includes(w) && w.length > 1);
+          const categoryString = keywords.join(',');
+          
+          progress.merge("orchestrate_polyhaven", { message: `Searching with categories: ${categoryString}` });
+
+          const searchResult = await sendCommandToBlender("search_polyhaven_assets", { 
+              asset_type: assetIntent.asset_type,
+              categories: categoryString 
+          });
+
+          if (!searchResult.assets || Object.keys(searchResult.assets).length === 0) {
+              throw new Error(`No models found on PolyHaven for categories: ${categoryString}`);
+          }
+        
+          const assetId = Object.keys(searchResult.assets)[0]; // Get first asset
+          progress.merge("orchestrate_polyhaven", { message: `Found asset ${assetId}, downloading...` });
+
+          const importResult = await sendCommandToBlender("download_polyhaven_asset", {
+              asset_id: assetId,
+              asset_type: assetIntent.asset_type,
+              resolution: "1k",
+              file_format: assetIntent.asset_type === 'hdris' ? 'hdr' : 'gltf'
+          });
+
+          if (!importResult.success) {
+             throw new Error(`Failed to import PolyHaven asset: ${importResult.error || 'Unknown error'}`);
+          }
+          
+          const objectName = importResult.imported_objects?.[0] || importResult.material_name || importResult.image_name || "PolyHaven_Asset";
+          preflightAsset = { name: objectName, type: 'PolyHaven', assetType: assetIntent.asset_type };
+          progress.merge("orchestrate_polyhaven", { message: "PolyHaven asset imported", object: objectName });
+        }
+      } catch (err) {
+        progress.addError("orchestration_failed", `Asset integration ${assetIntent.type} failed`, err.message);
+        // Fallback: The generationInputPrompt remains the rawPrompt, and we try procedural generation.
+      }
+
+      // If an asset was imported, refresh scene context and create a refinement prompt
+      if (preflightAsset) {
+        progress.add("scene_context_refresh", "Refreshing scene context after asset import");
+        sceneContext = await sendCommandToBlender("get_scene_info", {});
+        progress.merge("scene_context_refresh", { objectCount: sceneContext.object_count });
+
+        // Create a different refinement prompt based on asset type
+        if (preflightAsset.type === 'Hyper3D' || preflightAsset.type === 'Sketchfab' || (preflightAsset.type === 'PolyHaven' && preflightAsset.assetType === 'models')) {
+          // It's a 3D model, so select, scale, and move it.
+          generationInputPrompt = `A new model named "${preflightAsset.name}" was just imported from ${preflightAsset.type} to fulfill the user's request ("${rawPrompt}").
+Generate Python code to:
+1. Select this new object (its name is "${preflightAsset.name}").
+2. Make it the active object.
+3. Scale the object uniformly so its largest dimension is 2.0 meters.
+4. Move the object so its center is at (0, 0, 1.0), 1 meter above the grid.`;
+        } else if (preflightAsset.type === 'PolyHaven' && preflightAsset.assetType === 'textures') {
+          // It's a texture. Apply it to the 'active' object, or a cube if none exists.
+           generationInputPrompt = `A new material named "${preflightAsset.name}" was just imported to fulfill the user's request ("${rawPrompt}").
+Generate Python code to:
+1. Find the active object. If no object is active or selected, create a new cube.
+2. Apply the material named "${preflightAsset.name}" to this object.`;
+        } else if (preflightAsset.type === 'PolyHaven' && preflightAsset.assetType === 'hdris') {
+          // It's an HDRI. No further code is needed as the addon already set it as the world.
+          generationInputPrompt = `Tell the user the HDRI "${preflightAsset.name}" was successfully applied as the world environment.`;
+        } else {
+          // Default refinement prompt
+          generationInputPrompt = `A new asset named "${preflightAsset.name}" was imported. Select it and scale it to 2.0 meters.`;
+        }
+        
+        progress.add("prompt_refine", "Prompt updated for asset refinement");
+      }
+    }
+    // --- END ORCHESTRATION LOGIC ---
+
+
+    const nonSystemHistory = history.filter((msg) => msg.role !== "system");
+    let finalPrompt = generationInputPrompt; // Note: enhancement is separate from orchestration
+    
+    // We save the USER'S original prompt, not the refinement prompt
     const sanitizedAttachments = (attachments || []).map(({ id, name, type, size }) => ({
       id,
       name,
@@ -253,16 +491,20 @@ async function runGenerationCore(body, user) {
     progress.add("message_record", "Recording user message");
     await saveMessage(conversation.id, {
       role: "user",
-      content: finalPrompt,
+      content: rawPrompt, // <-- Save the original user prompt
       metadata: {
         originalPrompt: rawPrompt,
-        enhancedPrompt: shouldEnhance ? finalPrompt : null,
+        enhancedPrompt: shouldEnhance ? finalPrompt : null, // This 'finalPrompt' is from enhancement, not orchestration
         attachments: sanitizedAttachments,
+        orchestrationInput: generationInputPrompt, // <-- Store what we sent to the LLM
       },
     });
     progress.merge("message_record", { message: "User message recorded" });
 
-    const historyWithCurrent = [...nonSystemHistory, { role: "user", content: finalPrompt }];
+    // We use the 'generationInputPrompt' for the history context
+    const historyWithCurrent = [...nonSystemHistory, { role: "user", content: generationInputPrompt }];
+    
+    // Get the *fixed* system prompt (no asset strategy)
     let systemPrompt = getSystemPrompt(historyWithCurrent.length > 1, sceneContext, integrationStatus);
     if (agentType && AGENT_TIPS[String(agentType).toLowerCase()]) {
       systemPrompt = `${systemPrompt}\n\n${AGENT_TIPS[String(agentType).toLowerCase()]}`;
@@ -273,16 +515,16 @@ async function runGenerationCore(body, user) {
       .map((msg) => `${msg.role === "user" ? "User" : "Assistant"}: ${msg.content}`)
       .join("\n\n");
 
-    const docSnippets = getRelevantDocs(finalPrompt);
+    const docSnippets = getRelevantDocs(generationInputPrompt); // Use LLM's input prompt
     let generationPrompt = historyWithCurrent.length > 1
-      ? `${systemPrompt}\n\nConversation history:\n${conversationContext}\n\nCurrent user request: ${finalPrompt}`
-      : `${systemPrompt}\n\nUser request: ${finalPrompt}`;
+      ? `${systemPrompt}\n\nConversation history:\n${conversationContext}\n\nCurrent user request: ${generationInputPrompt}`
+      : `${systemPrompt}\n\nUser request: ${generationInputPrompt}`;
     if (docSnippets.length) {
       generationPrompt = `${generationPrompt}\n\nHelpful API snippets:\n${docSnippets.map((t, i) => `${i + 1}. ${t}`).join("\n")}`;
     }
     progress.add("prompt_ready", "Prepared generation prompt", { docSnippetCount: docSnippets.length });
 
-    const shouldCache = !dryRun && !abTest && !visualRefine;
+    const shouldCache = !dryRun && !abTest && !visualRefine && !preflightAsset; // Don't cache refinement prompts
     const cacheKey = shouldCache ? cacheKeyFromPrompt(generationPrompt) : null;
     let cachedCode = null;
     if (cacheKey) {
@@ -301,7 +543,7 @@ async function runGenerationCore(body, user) {
       if (!genAI) {
         throw new Error("Gemini provider is not configured");
       }
-      progress.add("model_generate", "Generating Blender code with Gemini 2.5 Flash");
+      progress.add("model_generate", "Generating Blender code with Gemini");
       const modelClient = genAI.getGenerativeModel({ model: GEMINI_MODEL });
       const result = await modelClient.generateContent(generationPrompt);
       const rawOutput = extractCodeFromText(result?.response?.text?.() || "");
@@ -357,7 +599,7 @@ async function runGenerationCore(body, user) {
       let critique = "";
       try {
         const critiquePrompt = `You are reviewing Blender 4.5 Python code. Briefly list issues and propose concrete fixes. Return a short bullet list of suggestions, no code fences.\n\nCODE:\n${sanitizedCode}`;
-  const { code: reviewText } = await callLLMForCode(critiquePrompt);
+        const { code: reviewText } = await callLLMForCode(critiquePrompt); // This uses Gemini
         critique = reviewText;
       } catch (err) {
         progress.addError("dry_run_critique", "Failed to produce critique", err?.message || String(err));
@@ -402,7 +644,7 @@ async function runGenerationCore(body, user) {
           const critiqueText = "You are reviewing the Blender viewport image against the user request. 1) Briefly state if the image matches the request. 2) If not perfect, output ONLY Blender Python code to refine the scene (no markdown).";
           const modelClient = genAI.getGenerativeModel({ model: GEMINI_MODEL });
           const visionResp = await modelClient.generateContent([
-            { text: `USER REQUEST: ${finalPrompt}` },
+            { text: `USER REQUEST: ${rawPrompt}` }, // Use original prompt for vision check
             { text: critiqueText },
             { inlineData: { data: base64, mimeType: "image/png" } },
           ]);
@@ -441,6 +683,7 @@ async function runGenerationCore(body, user) {
         attempts,
         preflightIssues,
         progress: progress.steps,
+        orchestrationInput: (generationInputPrompt !== rawPrompt) ? generationInputPrompt : null,
       },
     });
 
@@ -644,7 +887,7 @@ function parseIncomingMessages(chunk) {
 
         if (parsed.status === "error") {
           pending.reject(new Error(parsed.message || "Unknown error from Blender"));
-    } else {
+      } else {
           pending.resolve(parsed.result || parsed);
         }
 
@@ -663,8 +906,8 @@ function parseIncomingMessages(chunk) {
         const firstBrace = buffer.indexOf("{");
         if (firstBrace === -1) {
           buffer = "";
-    return;
-  }
+      return;
+    }
 
         if (firstBrace === 0) {
           const nextBrace = buffer.indexOf("{", 1);
@@ -715,12 +958,23 @@ function processRequestQueue() {
   const json = JSON.stringify({ type: commandType, params });
   console.log(`📤 [Request ${requestId}] Sending command to Blender:`, json);
 
+  // FIXED: Give all long-running API calls a longer timeout
+  let timeoutMs = 15000; // Default 15s
+  if (
+    commandType.startsWith('download_') || 
+    commandType.startsWith('search_') || 
+    commandType.startsWith('create_rodin_job') ||
+    commandType === 'poll_rodin_job_status' // Polling also needs time
+  ) {
+      timeoutMs = 60000; // 60s for all long-running API calls
+  }
+
   const timeout = setTimeout(() => {
     const pending = pendingRequests.get(requestId);
     if (pending) {
       timedOutRequests.add(requestId);
       pendingRequests.delete(requestId);
-      pending.reject(new Error("Timeout waiting for Blender response"));
+      pending.reject(new Error(`Timeout: No response for ${commandType} after ${timeoutMs / 1000}s.`));
 
       if (expectedResponseId === requestId) {
         const nextId = Array.from(pendingRequests.keys())[0];
@@ -731,7 +985,7 @@ function processRequestQueue() {
         pending.onComplete();
       }
     }
-  }, 15000);
+  }, timeoutMs); // Use the new dynamic timeout
 
   pendingRequests.set(requestId, {
     resolve,
@@ -806,7 +1060,7 @@ function sanitizeBlenderCode(code) {
   // Replace invalid delete-all operator with valid clearing logic
   // bpy.ops.wm.obj_delete_all() is not a real operator; use select_all + object.delete
   code = code.replace(/bpy\.ops\.wm\.obj_delete_all\(\)/g,
-    "bpy.ops.object.select_all(action='SELECT')\nif bpy.data.objects:\n    bpy.ops.object.delete()");
+    "if bpy.data.objects:\n    bpy.ops.object.select_all(action='SELECT')\n    bpy.ops.object.delete()");
 
   // Remove attempts to enable addons at runtime (often unavailable in headless/vanilla installs)
   code = code.replace(/^\s*bpy\.ops\.preferences\.addon_enable\([^)]*\)\s*$/gm, "");
@@ -823,6 +1077,11 @@ function sanitizeBlenderCode(code) {
   // If code references bmesh operations, ensure we enter edit mode (best-effort)
   if (/\bbmesh\b/.test(code) && !/mode_set\(mode='EDIT'\)/.test(code)) {
     code = `# ensure edit mode for bmesh\nif bpy.context.object and bpy.context.object.mode != 'EDIT':\n    bpy.ops.object.mode_set(mode='EDIT')\n` + code;
+  }
+  
+  // Add import bpy if missing
+  if (!/\bimport\s+bpy\b/.test(code)) {
+    code = "import bpy\n" + code;
   }
 
   return code;
@@ -867,7 +1126,7 @@ function preflightValidateCode(code) {
 // Extract python code from possible markdown fences
 function extractCodeFromText(text) {
   if (!text) return "";
-  const match = text.match(/```(?:python|py)?\s*([\s\S]*?)```/);
+  const match = text.match(/```(?:python|py)?\s*([\sS]*?)```/);
   return (match ? match[1] : text.replace(/```/g, "")).trim();
 }
 
@@ -915,6 +1174,9 @@ async function tryExecuteWithRecovery({
       if (/context.*incorrect/i.test(errorMessage)) {
         lastHints.push("Ensure an object is active, select it, and switch to correct mode before operators.");
       }
+      if (/world_bounding_box/i.test(errorMessage)) {
+          lastHints.push("To get world_bounding_box, object must be selected and active, and in OBJECT mode.");
+      }
 
       const entry = { index: i, ok: false, error: errorMessage, hints: lastHints };
       attempts.push(entry);
@@ -929,9 +1191,10 @@ async function tryExecuteWithRecovery({
 3) Use Blender 4.5 API only. NEVER use: use_undo, use_global, constraint_axis, or non-existent ops.
 4) Do NOT enable addons at runtime. Use built-in primitives and nodes only.
 5) Always ensure correct context for operators: active object, selection, and mode (OBJECT vs EDIT).
-6) For deletion: select objects then bpy.ops.object.delete().
+6) For deletion: if bpy.data.objects: bpy.ops.object.select_all(action='SELECT'); bpy.ops.object.delete().
 7) Voronoi node uses node.feature / node.distance (no node.voronoi_texture.*).
 8) Loop cuts: use bpy.ops.mesh.loopcut in EDIT mode with edges selected (or bmesh subdivide edges).
+9) To get object bounds: \`bbox = [obj.matrix_world @ v.co for v in obj.bound_box]\`
 
 ERROR:
 ${errorMessage}
@@ -943,7 +1206,7 @@ ${code}
 
 Return ONLY the fully corrected Blender Python code, ready to run now.`;
 
-  const { code: repaired } = await callLLMForCode(repairPrompt);
+      const { code: repaired } = await callLLMForCode(repairPrompt);
       if (!repaired) {
         // If LLM couldn't repair, stop early
         return { ok: false, error: errorMessage, code: sanitized, attempts, hints: lastHints };
@@ -1167,7 +1430,7 @@ CRITICAL RULES:
 1. Output ONLY valid bpy Python code compatible with Blender 4.5 - NO explanations, NO markdown, NO backticks
 2. Code must be executable in Blender 4.5 as-is
 3. Start ALL code with: import bpy
-4. Do NOT use file I/O or imports other than bpy
+4. Do NOT use file I/O or imports other than bpy, bmesh, and mathutils.
 5. Use precise measurements, proportions, and realistic geometry
 6. For complex objects, break them into logical parts (e.g., body, head, limbs for animals)
 7. Use appropriate modifiers (Subdivision Surface, Array, etc.) for better results
@@ -1184,27 +1447,14 @@ ACCURACY GUIDELINES:
 - For animals/creatures: Create anatomically correct proportions, use proper body part segmentation
 - For objects: Use realistic dimensions and proportions
 - For scenes: Create proper spatial relationships and scale
-- Always clear the scene before creating new objects (unless modifying existing ones)
+- Always clear the scene *only if* the user asks to "clear" or "delete all". Otherwise, add to or modify the existing scene.
 - Use appropriate mesh primitives and modifiers for realistic results
 - Apply smooth shading for organic objects
 - Use proper rotation and positioning for objects
 `;
 
-  // Add integration status information
-  basePrompt += `
-AVAILABLE ASSET INTEGRATIONS:
-- Hyper3D Rodin: ${integrationStatus.hyper3d ? 'ENABLED - Use generate_hyper3d_model_via_text() or generate_hyper3d_model_via_images() for custom/unique items' : 'DISABLED'}
-- PolyHaven: ${integrationStatus.polyhaven ? 'ENABLED - Use download_polyhaven_asset() for generic objects, textures, and HDRIs' : 'DISABLED'}
-- Sketchfab: ${integrationStatus.sketchfab ? 'ENABLED - Use search_sketchfab_models() then download_sketchfab_model() for realistic/specific items' : 'DISABLED'}
-
-IMPORTANT: These functions (get_hyper3d_status, generate_hyper3d_model_via_text, etc.) are available as Python functions in the Blender addon.
-You can call them directly in your code. If Hyper3D is enabled, use it for high-detail, realistic models (especially animals/creatures).
-If an integration is disabled, do NOT try to use it - fall back to procedural modeling instead.
-`;
-
-  basePrompt += `
-${ASSET_CREATION_STRATEGY_PROMPT}
-`;
+  // Add the new rectified strategy prompt
+  basePrompt += `\n${RECTIFIED_ASSET_STRATEGY_PROMPT}\n`;
 
   // Few-shot examples (small, focused, high-signal)
   const FEW_SHOT = `
@@ -1255,6 +1505,7 @@ CURRENT SCENE CONTEXT:
 - Existing objects in scene: ${sceneContext.objects.join(", ")}
 - Object count: ${sceneContext.object_count}
 - When modifying, preserve objects not mentioned in the request
+- If a new asset was just imported (e.g. "Dragon.001"), the user prompt will ask you to select, scale, and position it. Follow those instructions.
 `;
   }
 
@@ -1287,10 +1538,7 @@ const API_SNIPPETS = [
     key: "camera_set",
     text: "Set camera: cam=bpy.data.cameras.new('Cam'); obj=bpy.data.objects.new('CamObj', cam); bpy.context.scene.collection.objects.link(obj); bpy.context.scene.camera = obj",
   },
-  {
-    key: "asset_strategy_core",
-    text: "Asset creation strategy: always call get_scene_info(); check get_polyhaven_status(), get_sketchfab_status(), get_hyper3d_status(); prefer download_polyhaven_asset()/search_sketchfab_models()+download_sketchfab_model()/generate_hyper3d_model_via_text or images + poll_rodin_job_status + import_generated_asset; after import adjust via world_bounding_box, location, scale, rotation; only script primitives if integrations unavailable.",
-  },
+  // REMOVED asset_strategy_core as it is no longer the LLM's responsibility
 ];
 
 function getRelevantDocs(promptText) {
@@ -1303,13 +1551,12 @@ function getRelevantDocs(promptText) {
       (s.key === 'material_assign' && /material|shader|color/.test(lower)) ||
       (s.key === 'edit_mode' && /edit mode|bmesh|loopcut|subdivide|extrude/.test(lower)) ||
       (s.key === 'loopcut' && /loopcut|edge cut/.test(lower)) ||
-      (s.key === 'camera_set' && /camera|render view|shot/.test(lower))
+      (s.key === 'camera_set' && /camera|render view|shot/.test(lower)) ||
+      // New trigger for the refinement prompt
+      (s.key === 'edit_mode' && /select this new object|world_bounding_box/.test(lower))
     ) {
       picks.push(s.text);
       continue;
-    }
-    if (s.key === 'asset_strategy_core') {
-      picks.push(s.text);
     }
   }
   return picks.slice(0, 5);
@@ -1664,27 +1911,32 @@ app.get("/api/generate/stream", authenticate, async (req, res) => {
   (async () => {
     try {
       const q = req.query || {};
-      const prompt = String(q.prompt || "");
+      const rawPrompt = String(q.prompt || "");
       const conversationId = q.conversationId ? String(q.conversationId) : undefined;
       const captureScreenshot = String(q.captureScreenshot || "false").toLowerCase() === 'true';
 
-      if (!prompt.trim()) { send('error', { error: 'Prompt required' }); return res.end(); }
+      if (!rawPrompt.trim()) { send('error', { error: 'Prompt required' }); return res.end(); }
       send('status', { stage: 'init' });
+      
+      let generationInputPrompt = rawPrompt; // This will be the prompt for the LLM
 
       let conversation;
       if (conversationId) {
         conversation = await getConversationForUser(req.user.id, conversationId);
         if (!conversation) { send('error', { error: 'Conversation not found' }); return res.end(); }
       } else {
-        conversation = await createConversation(req.user.id, deriveTitleFromPrompt(prompt));
+        conversation = await createConversation(req.user.id, deriveTitleFromPrompt(rawPrompt));
       }
+      send('status', { stage: 'conversation_loaded', conversationId: conversation.id });
 
       const history = await getMessagesForHistory(conversation.id, 10);
       let sceneContext = conversation.lastSceneContext || null;
       let integrationStatus = { hyper3d: false, polyhaven: false, sketchfab: false };
       
-      if (blenderClient && blenderConnected) {
-        try { sceneContext = await sendCommandToBlender('get_scene_info', {}); } catch {}
+      const blenderAvailable = Boolean(blenderClient && blenderConnected);
+
+      if (blenderAvailable) {
+        try { sceneContext = await sendCommandToBlender('get_scene_info', {}); } catch(e) { send('status', { stage: 'scene_info_failed', error: e.message }); }
         
         // Check integration status
         try {
@@ -1697,31 +1949,153 @@ app.get("/api/generate/stream", authenticate, async (req, res) => {
             polyhaven: polyhavenStatus?.enabled === true,
             sketchfab: sketchfabStatus?.enabled === true,
           };
+          send('status', { stage: 'integration_checked', ...integrationStatus });
         } catch (err) {
-          // Integration check failed, use defaults
+          send('status', { stage: 'integration_check_failed', error: err.message });
         }
       }
 
-      const nonSystemHistory = history.filter((m)=> m.role !== 'system');
-      const finalPrompt = prompt;
-      await saveMessage(conversation.id, { role: 'user', content: finalPrompt });
+      // --- FIXED ORCHESTRATION LOGIC (for STREAM) ---
+      let preflightAsset = null;
+      const assetIntent = detectAssetIntent(rawPrompt, integrationStatus);
+      
+      // Create a dummy progress object for the polling function
+      const streamProgress = {
+        add: (key, msg, data) => send('status', { stage: key, message: msg, ...data }),
+        merge: (key, data) => send('status', { stage: key, ...data }),
+        addError: (key, msg, err) => send('error', { stage: key, message: msg, error: err })
+      };
+      
+      try {
+        if (blenderAvailable && assetIntent.type === 'hyper3d') {
+          send('status', { stage: 'orchestrate_hyper3d', prompt: assetIntent.prompt });
+          
+          // Step 2: Trigger
+          const job = await sendCommandToBlender("create_rodin_job", { text_prompt: assetIntent.prompt });
+          
+          // Step 2b: Parse
+          const subscriptionKey = job.jobs?.subscription_key;
+          const taskUuid = job.uuid;
+          if (!subscriptionKey || !taskUuid) {
+              throw new Error(`Addon did not return 'jobs.subscription_key' or 'uuid'.`);
+          }
+          send('status', { stage: 'orchestrate_hyper3d_submitted', taskUuid });
 
-      const historyWithCurrent = [...nonSystemHistory, { role:'user', content: finalPrompt }];
+          // Step 3: Poll
+          await pollHyper3DJob(subscriptionKey, streamProgress);
+          
+          // Step 4: Import
+          const importResult = await sendCommandToBlender("import_generated_asset", {
+              task_uuid: taskUuid,
+              name: rawPrompt
+          });
+
+          if (!importResult.succeed || !importResult.name) {
+              throw new Error(`Failed to import asset: ${importResult.error || 'Unknown import error'}`);
+          }
+          
+          preflightAsset = { name: importResult.name, type: 'Hyper3D', assetType: 'models' };
+          send('status', { stage: 'orchestrate_hyper3d_complete', object: importResult.name });
+        
+        } else if (blenderAvailable && assetIntent.type === 'sketchfab') {
+          send('status', { stage: 'orchestrate_sketchfab', query: assetIntent.query });
+          const searchResult = await sendCommandToBlender("search_sketchfab_models", { query: assetIntent.query });
+          const firstHit = searchResult?.results?.[0];
+          if (firstHit?.uid) {
+            send('status', { stage: 'orchestrate_sketchfab_found', uid: firstHit.uid });
+            const importResult = await sendCommandToBlender("download_sketchfab_model", { uid: firstHit.uid });
+            if (!importResult.success || !importResult.imported_objects || importResult.imported_objects.length === 0) {
+               throw new Error(`Failed to import Sketchfab model: ${importResult.error || 'No objects imported'}`);
+            }
+            const objectName = importResult.imported_objects[0];
+            preflightAsset = { name: objectName, type: 'Sketchfab', assetType: 'models' };
+            send('status', { stage: 'orchestrate_sketchfab_complete', object: objectName });
+          } else {
+            send('error', { stage: 'orchestrate_sketchfab_failed', message: 'No models found' });
+          }
+
+        } else if (blenderAvailable && assetIntent.type === 'polyhaven') {
+          send('status', { stage: 'orchestrate_polyhaven', ...assetIntent });
+
+          const stopWords = ['a', 'an', 'the', 'of', 'for', 'with', 'and'];
+          const keywords = (assetIntent.query || rawPrompt).split(' ')
+                                      .map(w => w.toLowerCase())
+                                      .filter(w => !stopWords.includes(w) && w.length > 1);
+          const categoryString = keywords.join(',');
+          
+          send('status', { stage: 'orchestrate_polyhaven_searching', categories: categoryString });
+
+          const searchResult = await sendCommandToBlender("search_polyhaven_assets", { 
+              asset_type: assetIntent.asset_type,
+              categories: categoryString 
+          });
+
+          if (!searchResult.assets || Object.keys(searchResult.assets).length === 0) {
+              throw new Error(`No models found on PolyHaven for categories: ${categoryString}`);
+          }
+        
+          const assetId = Object.keys(searchResult.assets)[0]; // Get first asset
+          send('status', { stage: 'orchestrate_polyhaven_found', assetId });
+
+          const importResult = await sendCommandToBlender("download_polyhaven_asset", {
+              asset_id: assetId,
+              asset_type: assetIntent.asset_type,
+              resolution: "1k",
+              file_format: assetIntent.asset_type === 'hdris' ? 'hdr' : 'gltf'
+          });
+
+          if (!importResult.success) {
+             throw new Error(`Failed to import PolyHaven asset: ${importResult.error || 'Unknown error'}`);
+          }
+          
+          const objectName = importResult.imported_objects?.[0] || importResult.material_name || importResult.image_name || "PolyHaven_Asset";
+          preflightAsset = { name: objectName, type: 'PolyHaven', assetType: assetIntent.asset_type };
+          send('status', { stage: 'orchestrate_polyhaven_complete', object: objectName });
+        }
+      } catch (err) {
+        send('error', { stage: 'orchestration_failed', type: assetIntent.type, error: err.message });
+      }
+
+      if (preflightAsset) {
+        sceneContext = await sendCommandToBlender("get_scene_info", {});
+        // Create a different refinement prompt based on asset type
+        if (preflightAsset.type === 'Hyper3D' || preflightAsset.type === 'Sketchfab' || (preflightAsset.type === 'PolyHaven' && preflightAsset.assetType === 'models')) {
+          generationInputPrompt = `A new asset named "${preflightAsset.name}" was just imported from ${preflightAsset.type} to fulfill the user's request ("${rawPrompt}"). Generate Python code to select this object, scale it to 2.0 meters on its largest axis, and place it at the scene origin (0, 0, 0), sitting on the Z=0 plane.`;
+        } else if (preflightAsset.type === 'PolyHaven' && preflightAsset.assetType === 'textures') {
+           generationInputPrompt = `A new material named "${preflightAsset.name}" was just imported to fulfill the user's request ("${rawPrompt}"). Generate Python code to apply this material to the active object, or a new cube if no object is active.`;
+        } else if (preflightAsset.type === 'PolyHaven' && preflightAsset.assetType === 'hdris') {
+          generationInputPrompt = `Tell the user the HDRI "${preflightAsset.name}" was successfully applied as the world environment.`;
+        } else {
+          generationInputPrompt = `A new asset named "${preflightAsset.name}" was imported. Select it.`;
+        }
+        send('status', { stage: 'prompt_refined' });
+      }
+      // --- END ORCHESTRATION LOGIC (for STREAM) ---
+
+      const nonSystemHistory = history.filter((m)=> m.role !== 'system');
+      await saveMessage(conversation.id, { role: 'user', content: rawPrompt }); // Save original prompt
+
+      const historyWithCurrent = [...nonSystemHistory, { role:'user', content: generationInputPrompt }]; // Use new prompt
       const systemPrompt = getSystemPrompt(historyWithCurrent.length > 1, sceneContext, integrationStatus);
       const conversationContext = historyWithCurrent.slice(-6).map((m)=> `${m.role==='user'?'User':'Assistant'}: ${m.content}`).join('\n\n');
-      const docSnippets = getRelevantDocs(finalPrompt);
-      const base = historyWithCurrent.length>1 ? `${systemPrompt}\n\nConversation history:\n${conversationContext}\n\nCurrent user request: ${finalPrompt}` : `${systemPrompt}\n\nUser request: ${finalPrompt}`;
+      const docSnippets = getRelevantDocs(generationInputPrompt);
+      const base = historyWithCurrent.length>1 ? `${systemPrompt}\n\nConversation history:\n${conversationContext}\n\nCurrent user request: ${generationInputPrompt}` : `${systemPrompt}\n\nUser request: ${generationInputPrompt}`;
       const fullPrompt = docSnippets.length ? `${base}\n\nHelpful API snippets:\n${docSnippets.map((t,i)=>`${i+1}. ${t}`).join('\n')}` : base;
       send('status', { stage:'prompt_ready' });
 
       const providerUsed = 'gemini';
-      const cacheKey = cacheKeyFromPrompt(fullPrompt);
+      const cacheKey = !preflightAsset ? cacheKeyFromPrompt(fullPrompt) : null; // Don't cache refinement
       let sanitizedCode = null;
-      const cached = cacheGet(cacheKey);
-      if (cached?.code) {
-        sanitizedCode = cached.code;
-        send('cache', { hit: true });
-      } else {
+      
+      if(cacheKey) {
+        const cached = cacheGet(cacheKey);
+        if (cached?.code) {
+          sanitizedCode = cached.code;
+          send('cache', { hit: true });
+        }
+      }
+
+      if (!sanitizedCode) {
         send('cache', { hit: false });
         if (!genAI) {
           send('error', { error: 'Gemini provider not configured' });
@@ -1732,7 +2106,9 @@ app.get("/api/generate/stream", authenticate, async (req, res) => {
           const generation = await modelClient.generateContent(fullPrompt);
           const rawOutput = extractCodeFromText(generation?.response?.text?.() || "");
           sanitizedCode = sanitizeBlenderCode(rawOutput);
-          cacheSet(cacheKey, { code: sanitizedCode });
+          if (cacheKey) {
+             cacheSet(cacheKey, { code: sanitizedCode });
+          }
         } catch (err) {
           send('error', { error: err.message || 'Generation failed' });
           return res.end();
@@ -1748,6 +2124,12 @@ app.get("/api/generate/stream", authenticate, async (req, res) => {
 
       const onAttempt = async (a) => send('attempt', a);
       send('status', { stage: 'executing' });
+      
+      if (!blenderAvailable) {
+        send('error', { error: 'Blender not connected, cannot execute.' });
+        return res.end();
+      }
+
       const recovery = await tryExecuteWithRecovery({
         initialCode: sanitizedCode,
         maxAttempts: Number(process.env.LLM_REPAIR_ATTEMPTS || 2),
@@ -1757,7 +2139,7 @@ app.get("/api/generate/stream", authenticate, async (req, res) => {
       if (!recovery.ok) { send('final', { ok:false, error: recovery.error, attempts: recovery.attempts||[] }); return res.end(); }
 
       let screenshot = null;
-      if (captureScreenshot && blenderClient && blenderConnected) {
+      if (captureScreenshot) {
         try { const img = await sendCommandToBlender('get_viewport_screenshot', { max_size: 800 }); screenshot = img?.data || img?.image || img || null; } catch {}
       }
 
@@ -1870,6 +2252,8 @@ async function startServer() {
     connectToBlenderTCP();
     app.listen(PORT, () => {
       console.log(`🚀 Backend running at http://localhost:${PORT}`);
+      console.log(`🤖 Gemini API: ${genAI ? '✅ Configured' : '❌ Not configured'} (Model: ${GEMINI_MODEL})`);
+      console.log(`🚀 Groq API (prompt enhancement): ${groqClient ? '✅ Configured' : '❌ Not configured'}`);
     });
   } catch (err) {
     console.error("❌ Failed to start backend:", err.message);
@@ -1891,5 +2275,3 @@ app.get("/api/models", authenticate, async (req, res) => {
     res.status(500).json({ error: "Failed to load models", details: err?.message || String(err) });
   }
 });
-
-
