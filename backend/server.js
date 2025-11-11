@@ -11,7 +11,6 @@ import Groq from "groq-sdk";
 import { pool, initSchema, mapConversation, mapMessage } from "./db.js";
 // import { runLangGraphPipeline } from "./agents/langgraphPipeline.js";
 import { createProgressTracker } from "./utils/progress.js";
-import { getHyper3DPromptContext } from "./utils/hyper3dPrompt.js";
 
 dotenv.config();
 
