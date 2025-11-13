@@ -2,6 +2,9 @@ const { app, BrowserWindow, shell } = require('electron');
 const path = require('path');
 const url = require('url');
 
+const isProd = process.env.NODE_ENV === 'production';
+const devServerURL = process.env.ELECTRON_START_URL;
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1200,
@@ -14,18 +17,23 @@ function createWindow() {
     },
   });
 
-  const indexPath = url.format({
-    pathname: path.join(__dirname, 'build', 'index.html'),
-    protocol: 'file:',
-    slashes: true,
-  });
+  if (devServerURL && !isProd) {
+    win.loadURL(devServerURL);
+  } else {
+    const indexPath = url.format({
+      pathname: path.join(__dirname, 'build', 'index.html'),
+      protocol: 'file:',
+      slashes: true,
+    });
+    win.loadURL(indexPath);
+  }
 
-  win.loadURL(indexPath);
+  if (!isProd && process.env.ELECTRON_OPEN_DEVTOOLS === 'true') {
+    win.webContents.once('did-frame-finish-load', () => {
+      win.webContents.openDevTools({ mode: 'detach' });
+    });
+  }
 
-  // Optional: open DevTools in dev builds
-    // win.webContents.openDevTools();
-
-  // Open all external links in the user's browser
   win.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);
     return { action: 'deny' };
