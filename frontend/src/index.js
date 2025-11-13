@@ -21,15 +21,18 @@ import ReactDOM from 'react-dom/client';
 import App from './App';
 import './index.css';
 import { AuthProvider } from './context/AuthContext';
+import { ThemeProvider } from './context/ThemeContext';
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 const isElectron = !!(window && window.process && window.process.versions && window.process.versions.electron);
 
 const renderApp = () => {
   root.render(
+    <ThemeProvider>
     <AuthProvider>
       <App />
     </AuthProvider>
+    </ThemeProvider>
   );
 };
 
