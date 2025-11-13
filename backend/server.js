@@ -239,6 +239,93 @@ function detectAssetIntent(promptText, integrationStatus) {
   return { type: 'none' };
 }
 
+function buildInlineImageParts(attachments = []) {
+  if (!Array.isArray(attachments) || attachments.length === 0) {
+    return [];
+  }
+
+  const parts = [];
+  for (const attachment of attachments) {
+    if (!attachment) continue;
+    const { dataUrl, type } = attachment;
+    if (typeof dataUrl !== "string" || dataUrl.length === 0) continue;
+
+    let mimeType = (typeof type === "string" && type.length > 0) ? type : null;
+    let base64Data = null;
+
+    const match = dataUrl.match(/^data:(.*?);base64,(.*)$/);
+    if (match) {
+      mimeType = mimeType || match[1];
+      base64Data = match[2];
+    } else {
+      base64Data = dataUrl;
+    }
+
+    if (!mimeType || !mimeType.startsWith("image/")) continue;
+    if (!base64Data || base64Data.trim().length === 0) continue;
+
+    parts.push({
+      inlineData: {
+        data: base64Data.trim(),
+        mimeType,
+      },
+    });
+  }
+
+  return parts;
+}
+
+function extractGeminiText(result) {
+  if (!result) return "";
+  if (typeof result === "string") return result;
+  const response = result?.response;
+  if (typeof response?.text === "function") {
+    return response.text() || "";
+  }
+  if (Array.isArray(response?.candidates) && response.candidates.length > 0) {
+    const parts = response.candidates[0]?.content?.parts || [];
+    return parts.map((p) => p?.text || "").join("\n");
+  }
+  return "";
+}
+
+function looksLikeBlenderCode(text) {
+  if (!text) return false;
+  const cleaned = text.trim().toLowerCase();
+  if (!cleaned) return false;
+  if (/i am sorry|cannot (directly )?analyze/.test(cleaned)) return false;
+  if (!/bpy/.test(cleaned) && !/import\s+bpy/.test(cleaned)) return false;
+  return true;
+}
+
+async function generateGeminiBlenderCode(modelClient, generationPrompt, geminiImageParts, progress) {
+  const hasImages = geminiImageParts.length > 0;
+
+  const buildRequest = (promptText) =>
+    hasImages
+      ? {
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: promptText }, ...geminiImageParts],
+            },
+          ],
+        }
+      : promptText;
+
+  let result = await modelClient.generateContent(buildRequest(generationPrompt));
+  let rawOutput = extractCodeFromText(extractGeminiText(result));
+
+  if (hasImages && !looksLikeBlenderCode(rawOutput)) {
+    progress.add("model_generate_retry", "Retrying Gemini with explicit image instructions");
+    const reminderPrompt = `${generationPrompt}\n\nCRITICAL: The user has attached reference image(s) above. Analyze these image attachments along with the prompt and return ONLY Blender Python code (no explanations).`;
+    result = await modelClient.generateContent(buildRequest(reminderPrompt));
+    rawOutput = extractCodeFromText(extractGeminiText(result));
+  }
+
+  return rawOutput;
+}
+
 
 // Core generation logic used by queue; mirrors /api/generate with minimal fields
 async function runGenerationCore(body, user) {
@@ -486,6 +573,7 @@ Generate Python code to:
       type,
       size,
     }));
+    const geminiImageParts = buildInlineImageParts(attachments);
 
     progress.add("message_record", "Recording user message");
     await saveMessage(conversation.id, {
@@ -523,7 +611,7 @@ Generate Python code to:
     }
     progress.add("prompt_ready", "Prepared generation prompt", { docSnippetCount: docSnippets.length });
 
-    const shouldCache = !dryRun && !abTest && !visualRefine && !preflightAsset; // Don't cache refinement prompts
+    const shouldCache = !dryRun && !abTest && !visualRefine && !preflightAsset && geminiImageParts.length === 0; // Don't cache refinement prompts or multimodal inputs
     const cacheKey = shouldCache ? cacheKeyFromPrompt(generationPrompt) : null;
     let cachedCode = null;
     if (cacheKey) {
@@ -544,8 +632,7 @@ Generate Python code to:
       }
       progress.add("model_generate", "Generating Blender code with Gemini");
       const modelClient = genAI.getGenerativeModel({ model: GEMINI_MODEL });
-      const result = await modelClient.generateContent(generationPrompt);
-      const rawOutput = extractCodeFromText(result?.response?.text?.() || "");
+      const rawOutput = await generateGeminiBlenderCode(modelClient, generationPrompt, geminiImageParts, progress);
       sanitizedCode = sanitizeBlenderCode(rawOutput);
       if (shouldCache && cacheKey && sanitizedCode) {
         cacheSet(cacheKey, { code: sanitizedCode });
@@ -689,7 +776,7 @@ Generate Python code to:
     const updatedConversation = await touchConversation(conversation.id, {
       sceneContext,
       title:
-        conversation.title === "New Scene" || !conversation.title
+        conversation.title === "New Scene" || conversation.title === "New Chat" || !conversation.title
           ? deriveTitleFromPrompt(rawPrompt)
           : undefined,
     });
@@ -1754,6 +1841,37 @@ app.delete("/api/conversation/:conversationId", authenticate, async (req, res) =
   }
 });
 
+app.patch("/api/conversation/:conversationId", authenticate, async (req, res) => {
+  const rl = checkRateLimit(req.user.id);
+  if (!rl.ok) {
+    res.set('Retry-After', Math.ceil(rl.retryAfterMs / 1000));
+    return res.status(429).json({ error: "Rate limit exceeded", retryAfterMs: rl.retryAfterMs });
+  }
+  try {
+    const { conversationId } = req.params;
+    const { title } = req.body || {};
+    
+    if (!title || !title.trim()) {
+      return res.status(400).json({ error: "Title is required" });
+    }
+    
+    const conversation = await getConversationForUser(req.user.id, conversationId);
+    if (!conversation) {
+      return res.status(404).json({ error: "Conversation not found" });
+    }
+    
+    const updated = await touchConversation(conversationId, { title: title.trim() });
+    if (!updated) {
+      return res.status(404).json({ error: "Conversation not found" });
+    }
+    
+    res.json({ conversation: updated });
+  } catch (err) {
+    console.error("❌ Update conversation error:", err.message);
+    res.status(500).json({ error: "Failed to update conversation" });
+  }
+});
+
 app.post("/api/enhance-prompt", authenticate, async (req, res) => {
   const rl = checkRateLimit(req.user.id);
   if (!rl.ok) {
@@ -2215,14 +2333,24 @@ app.post("/api/generate", authenticate, async (req, res) => {
     const result = await runGenerationCore(req.body || {}, req.user);
     res.json(result);
   } catch (err) {
-    const status = err?.message === "Prompt required"
-      ? 400
-      : err?.message === "Conversation not found"
-        ? 404
-        : 500;
+    let status = 500;
+    let message = err?.message || "Model generation failed";
+
+    if (err?.message === "Prompt required") {
+      status = 400;
+    } else if (err?.message === "Conversation not found") {
+      status = 404;
+    } else if (err?.status === 503 || err?.statusCode === 503 || err?.response?.status === 503 || /503/.test(err?.code || "")) {
+      status = 503;
+      message = "The AI model is temporarily overloaded. Please try again in a few moments.";
+    } else if (typeof message === "string" && /503|service unavailable/i.test(message)) {
+      status = 503;
+      message = "The AI model is temporarily overloaded. Please try again in a few moments.";
+    }
+
     console.error("❌ GENERATION ERROR:", err?.message || err);
     res.status(status).json({
-      error: err?.message || "Model generation failed",
+      error: message,
       details: err?.details || null,
       progress: err?.progress || [],
     });
