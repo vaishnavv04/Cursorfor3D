@@ -1,0 +1,34 @@
+---
+Topic: Creating Meshes
+- To create a primitive, use bpy.ops.mesh.primitive_*_add().
+- Example (Torus): bpy.ops.mesh.primitive_torus_add(major_radius=1.0, minor_radius=0.25)
+- Example (Cube): bpy.ops.mesh.primitive_cube_add(size=2, location=(0, 0, 1))
+- After creation, the new object is at `bpy.context.object`.
+---
+Topic: Materials
+- To create a new material: `mat = bpy.data.materials.new(name="MyMaterial")`
+- You MUST enable nodes: `mat.use_nodes = True`
+- The main shader node is `bsdf = mat.node_tree.nodes["Principled BSDF"]`
+- To set color: `bsdf.inputs["Base Color"].default_value = (R, G, B, A)`
+- To set roughness: `bsdf.inputs["Roughness"].default_value = (value)`
+- To set metallic: `bsdf.inputs["Metallic"].default_value = (value)`
+---
+Topic: Common Errors & Deprecated API (DO NOT USE)
+- CRITICAL: The `Principled BSDF` node does NOT have a "Specular" (0-1 float) input. That API is from Blender 2.7. It has been replaced by "Specular IOR Level".
+- CRITICAL: Do NOT use any `bpy.ops.view3d.*` operators (like `view_selected`). They will fail in scripts because there is no 3D viewport region.
+- CRITICAL: Do NOT use the `use_undo=True` parameter. It is deprecated.
+---
+Topic: Joining Objects
+- To join objects, they must be selected.
+- The "active" object is the one that all others will be joined *into*.
+- 1. Deselect all: `bpy.ops.object.select_all(action='DESELECT')`
+- 2. Select objects to join: `obj1.select_set(True)`, `obj2.select_set(True)`
+- 3. Set active object: `bpy.context.view_layer.objects.active = obj1`
+- 4. Join: `bpy.ops.object.join()`
+---
+Topic: Applying Modifiers
+- 1. Get the object: `obj = bpy.context.object`
+- 2. Add modifier: `mod = obj.modifiers.new(name="Subdivision", type='SUBSURF')`
+- 3. Set properties: `mod.levels = 2`
+- 4. To apply (make permanent): `bpy.ops.object.modifier_apply(modifier=mod.name)`
+---

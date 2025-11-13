@@ -26,6 +26,15 @@ const ChatInterface = () => {
   const [conversationId, setConversationId] = useState(null);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
+  // auto-resize chat textarea
+  useEffect(() => {
+    if (inputRef.current) {
+      const el = inputRef.current;
+      el.style.height = "auto";
+      // limit to 300px to avoid covering full screen
+      el.style.height = Math.min(el.scrollHeight, 300) + "px";
+    }
+  }, [input]);
   const [loading, setLoading] = useState(false);
   const [conversationsLoading, setConversationsLoading] = useState(true);
   const [messagesLoading, setMessagesLoading] = useState(false);
@@ -35,8 +44,8 @@ const ChatInterface = () => {
   const [enhancedPromptText, setEnhancedPromptText] = useState("");
   const [attachments, setAttachments] = useState([]);
   const [progress, setProgress] = useState([]);
-  // Hardcoded to use gemini-2.5-flash as the only model
-  const selectedModel = "gemini:gemini-2.5-flash";
+    // hard-coded model
+  const selectedModel = "gemini";
   const [enhancing, setEnhancing] = useState(false);
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
@@ -138,8 +147,6 @@ const ChatInterface = () => {
     },
     [baseUrl, token, logout]
   );
-
-  // No need to fetch models from backend as we're using a single hardcoded model
 
   const handleRename = useCallback(async (chatId, newName) => {
     if (!newName || !newName.trim()) {
@@ -311,45 +318,41 @@ const ChatInterface = () => {
     [authorizedFetch]
   );
 
-
   const creatingNewChatRef = useRef(false);
 
-const handleNewChat = useCallback(async () => {
-  if (creatingNewChatRef.current) return;
-  creatingNewChatRef.current = true;
+  const handleNewChat = useCallback(async () => {
+    if (creatingNewChatRef.current) return;
+    creatingNewChatRef.current = true;
 
-  try {
-    setMessages([]);
-    setConversationId(null);
-    const conversation = await createConversation("New Chat");
+    try {
+      setMessages([]);
+      setConversationId(null);
+      const conversation = await createConversation("New Chat");
 
-    
-    setConversations((prev) => {
-      const exists = prev.some((c) => c.id === conversation.id);
-      if (exists) return prev;
-      return [conversation, ...prev];
-    });
+      setConversations((prev) => {
+        const exists = prev.some((c) => c.id === conversation.id);
+        if (exists) return prev;
+        return [conversation, ...prev];
+      });
 
-    await loadConversation(conversation.id, { silent: true });
+      await loadConversation(conversation.id, { silent: true });
 
-    setShowEnhanced(false);
-    setEnhancedPromptText("");
-    setInput("");
-    setAttachments([]);
-    setActiveChat(conversation.id);
-    setEditingMessage(null);
-  } catch (err) {
-    console.error("Failed to start new chat", err);
-    setError(err.message || "Unable to create new chat");
-  } finally {
-    creatingNewChatRef.current = false;
-  }
-}, [
-  createConversation,
-  loadConversation,
-]);
-
-
+      setShowEnhanced(false);
+      setEnhancedPromptText("");
+      setInput("");
+      setAttachments([]);
+      setActiveChat(conversation.id);
+      setEditingMessage(null);
+    } catch (err) {
+      console.error("Failed to start new chat", err);
+      setError(err.message || "Unable to create new chat");
+    } finally {
+      creatingNewChatRef.current = false;
+    }
+  }, [
+    createConversation,
+    loadConversation,
+  ]);
 
   const handleEnhancePrompt = useCallback(async () => {
     if (!input.trim() || enhancing || loading) return;
@@ -993,20 +996,19 @@ const handleNewChat = useCallback(async () => {
               {conversationId ? "Active" : "New Chat"}
             </span>
           </div>
-          <div className="flex items-center gap-3 text-xs text-slate-500 dark:text-gray-400">
-            <span>Model: gemini-2.5-flash</span>
-            <button
+          <div className="flex items-center gap-3 text-xs text-slate-500 dark:text-gray-500">
+                        <button
               type="button"
               onClick={toggleTheme}
               className="flex items-center justify-center w-9 h-9 rounded-full border border-slate-200 dark:border-gray-700 bg-white dark:bg-gray-900 text-slate-600 dark:text-slate-200 hover:border-blue-500 dark:hover:border-blue-400 transition-colors"
               aria-label={`Switch to ${isDark ? "light" : "dark"} theme`}
             >
               {isDark ? (
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="currentColor" viewBox="0 0 20 20">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="currentColor" viewBox="0 0 24 24">
                   <path d="M10 2a1 1 0 011 1v1a1 1 0 11-2 0V3a1 1 0 011-1zm4.22 1.72a1 1 0 011.42 1.42l-.7.7a1 1 0 01-1.42-1.42l.7-.7zM17 9a1 1 0 110 2h-1a1 1 0 110-2h1zM5 10a1 1 0 01-1 1H3a1 1 0 010-2h1a1 1 0 011 1zm1.05-6.05a1 1 0 01.27 1.09l-.33.95a1 1 0 11-1.88-.64l.33-.95A1 1 0 016.05 3.95zM4.22 14.22a1 1 0 011.42 0l.7.7a1 1 0 11-1.42 1.42l-.7-.7a1 1 0 010-1.42zM10 16a1 1 0 011 1v1a1 1 0 11-2 0v-1a1 1 0 011-1zm5.78-1.78a1 1 0 111.42 1.42l-.7.7a1 1 0 11-1.42-1.42l.7-.7zM10 5a5 5 0 100 10A5 5 0 0010 5z" />
                 </svg>
               ) : (
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="currentColor" viewBox="0 0 20 20">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="currentColor" viewBox="0 0 24 24">
                   <path d="M17.293 13.293A8 8 0 016.707 2.707a7 7 0 108.586 8.586z" />
                 </svg>
               )}
@@ -1041,7 +1043,7 @@ const handleNewChat = useCallback(async () => {
                   <button
                     key={idx}
                     onClick={() => setInput(suggestion)}
-                    className="px-4 py-3 rounded-lg bg-white border border-slate-200 text-left text-sm text-slate-600 hover:bg-slate-100 hover:text-slate-900 transition-colors dark:bg-gray-800/50 dark:border-gray-700/50 dark:text-gray-300 dark:hover:bg-gray-800 dark:hover:text-white"
+                    className="px-4 py-3 rounded-lg bg-white border border-slate-200 text-left text-sm text-slate-600 hover:bg-slate-100 hover:text-slate-900 transition-colors dark:bg-gray-900/80 dark:border-gray-800 dark:text-gray-300 dark:hover:bg-gray-800 dark:hover:text-white"
                   >
                     {suggestion}
                   </button>
@@ -1125,13 +1127,6 @@ const handleNewChat = useCallback(async () => {
                           <p className="text-sm text-inherit">
                             {message.sceneContext.objects?.length || 0} objects in scene
                           </p>
-                        </div>
-                      )}
-                      {message.provider && (
-                        <div className="mb-2">
-                          <span className="text-xs px-2 py-1 rounded-full bg-slate-200 text-slate-600 dark:bg-gray-700/50 dark:text-gray-400">
-                            {message.provider.toUpperCase()}
-                          </span>
                         </div>
                       )}
                       {message.blenderResult && (
