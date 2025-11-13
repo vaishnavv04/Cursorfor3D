@@ -1,9 +1,12 @@
 import dotenv from "dotenv";
-import { Pool } from "pg";
+import pg from "pg";
+const { Pool } = pg;
 
 dotenv.config();
 
 const connectionString = process.env.DATABASE_URL || process.env.DATABASE_URI;
+
+const EMBEDDING_DIM = Number(process.env.EMBEDDING_DIM || 384);
 
 if (!connectionString) {
   throw new Error(
@@ -14,15 +17,19 @@ if (!connectionString) {
 const isSupabase = /supabase/i.test(connectionString);
 const pool = new Pool({
   connectionString,
-  ssl: isSupabase
-    ? {
-        rejectUnauthorized: false,
-      }
-    : undefined,
+  ssl: isSupabase ? { rejectUnauthorized: false } : undefined,
   connectionTimeoutMillis: 10000, // 10 second timeout
   idleTimeoutMillis: 30000,
   max: 20,
 });
+
+// --- FIX: Prevents unhandled errors on idle clients from crashing the app ---
+// This will catch background errors from the pool (like server shutdowns)
+// and log them instead of letting them become a fatal unhandled event.
+pool.on("error", (err) => {
+  console.error("[pg-pool] Unhandled error on idle client", err);
+});
+// -------------------------------------------------------------------------
 
 function mapConversation(row) {
   return {
@@ -53,46 +60,75 @@ async function initSchema() {
   try {
     client = await pool.connect();
   } catch (err) {
-    throw new Error(`Database connection failed: ${err.message}. Please check your DATABASE_URL and network connectivity.`);
+    throw new Error(
+      `Database connection failed: ${err.message}. Please check your DATABASE_URL and network connectivity.`
+    );
   }
-  
   try {
     await client.query("CREATE EXTENSION IF NOT EXISTS pgcrypto;");
+    // Also ensure pgvector is enabled, as we created the table for it.
+    await client.query("CREATE EXTENSION IF NOT EXISTS vector;");
 
     await client.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        email TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        display_name TEXT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        CREATE TABLE IF NOT EXISTS users (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          email TEXT UNIQUE NOT NULL,
+          password_hash TEXT NOT NULL,
+          display_name TEXT,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+      `);
+
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS conversations (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          title TEXT NOT NULL DEFAULT 'New Scene',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          last_scene_context JSONB
+        );
+      `);
+
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS messages (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+          role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+          content TEXT,
+          provider TEXT,
+          blender_result JSONB,
+          scene_context JSONB,
+          metadata JSONB DEFAULT '{}'::jsonb,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+      `);
+
+    // This is the table we created in the Supabase UI
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS blender_knowledge (
+        id bigserial PRIMARY KEY,
+        content text NOT NULL,
+        embedding vector(${EMBEDDING_DIM})
       );
     `);
 
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS conversations (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        title TEXT NOT NULL DEFAULT 'New Scene',
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        last_scene_context JSONB
-      );
+    const { rows: embeddingColumn } = await client.query(`
+      SELECT (atttypmod - 4) AS dim
+      FROM pg_attribute
+      WHERE attrelid = 'blender_knowledge'::regclass
+        AND attname = 'embedding'
+        AND NOT attisdropped;
     `);
 
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS messages (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-        role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
-        content TEXT,
-        provider TEXT,
-        blender_result JSONB,
-        scene_context JSONB,
-        metadata JSONB DEFAULT '{}'::jsonb,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    const currentDim = embeddingColumn[0]?.dim ?? null;
+    if (currentDim !== null && currentDim !== EMBEDDING_DIM) {
+      console.warn(
+        `[db] Adjusting blender_knowledge.embedding dimension from ${currentDim} to ${EMBEDDING_DIM}. Existing embeddings will be cleared.`
       );
-    `);
+      await client.query("TRUNCATE TABLE blender_knowledge;");
+      await client.query(`ALTER TABLE blender_knowledge ALTER COLUMN embedding TYPE vector(${EMBEDDING_DIM});`);
+    }
 
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations (user_id, updated_at DESC);"

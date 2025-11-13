@@ -16,9 +16,31 @@ code {
 @tailwind components;
 @tailwind utilities;
 
+
+
+:root {
+  color-scheme: light;
+  --color-bg: #bda1c0;
+  --color-text: #15213d;
+  --color-surface: #f08edd;
+  --color-border: #c59cb8;
+}
+
+.light {
+  color-scheme: light;
+}
+
+.dark {
+  color-scheme: dark;
+  --color-bg: #030347;
+  --color-text: #9bc1e7;
+  --color-surface: #291063;
+  --color-border: #122540;
+}
+
 body {
-  background-color: #0a0a0a;
-  color: white;
+  background-color: var(--color-bg);
+  color: var(--color-text);
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
     'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
     sans-serif;

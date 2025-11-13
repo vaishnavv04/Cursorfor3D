@@ -1,111 +1,13 @@
-// import React from 'react';
-// import Navbar from '../components/navbar';
-// import { useNavigate } from 'react-router-dom';
-// import { ArrowRight } from 'lucide-react';
-// import { useAuth } from '../context/AuthContext';
-
-// export default function HomePage() {
-//   const navigate = useNavigate();
-//   const { token } = useAuth();
-
-//   return (
-//     <div className="bg-black text-white min-h-screen flex flex-col overflow-y-auto">
-//       <Navbar />
-
-//       {/* Hero Section */}
-//       <div className="flex flex-col items-center justify-center flex-grow min-h-[90vh]">
-//         <h1 className="text-5xl font-bold text-center mt-10">
-//           Craft <span className="text-blue-400">Immersive Worlds</span> in Blender
-//         </h1>
-//         <button
-//           onClick={() => navigate(token ? '/generate' : '/auth')}
-//           className="mt-8 bg-blue-600 px-6 py-3 rounded-full hover:bg-blue-700 transition"
-//         >
-//           {token ? 'Return to workspace →' : 'Craft in 3D →'}
-//         </button>
-
-//         <div
-//           onClick={() => navigate(token ? '/generate' : '/auth')}
-//           className="mt-10 bg-gray-900 p-6 rounded-lg w-2/3 text-left flex items-center justify-between cursor-pointer hover:bg-gray-800 transition"
-//         >
-//           <p className="text-gray-400 text-lg">💡 Turn words into worlds</p>
-//           <ArrowRight className="text-blue-400" />
-//         </div>
-//       </div>
-
-//       {/* About Section
-//       <section id="about" className="min-h-[80vh] p-10 bg-gray-950">
-//         <h2 className="text-3xl font-semibold mb-4">About</h2>
-//         <p className="text-gray-400 leading-relaxed">
-//           Our AI-powered 3D generator transforms text prompts into dynamic 3D scenes,
-//           revolutionizing how creators visualize and prototype worlds in Blender.
-//         </p>
-//       </section> */}
-
-//       {/* about Section */}
-
-//       <section id="about" className="min-h-screen bg-black text-white p-10 flex flex-col lg:flex-row items-center justify-between">
-//   {/* Left Side Content */}
-//   <div className="lg:w-1/2 space-y-6">
-//     <h1 className="text-5xl font-bold leading-tight text-blue-200">
-//       The app. <br />
-//       <span className="text-blue-400"> generate 3D models in seconds.</span>
-//     </h1>
-
-//     <ul className="text-xl mt-8 space-y-4">
-//       <li className="text-gray-400"></li>
-//       <li className="text-gray-400"></li>
-//       <li>
-//         <span className="font-bold text-white"></span><br />
-//         <span className="text-gray-400"></span>
-//       </li>
-//     </ul>
-//   </div>
-
-//   {/* Right Side Image */}
-//   <div className="lg:w-1/2 mt-10 lg:mt-0 flex justify-center">
-//     <img
-//       src="/path-to-your-uploaded-image.png"
-//       alt="picture"
-//       className="rounded-xl shadow-lg max-w-full h-auto"
-//     />
-//   </div>
-// </section>
-
-
-//       {/* Use Cases Section */}
-//       <section id="usecases" className="min-h-[80vh] p-10 bg-gray-900">
-//         <h2 className="text-3xl font-semibold mb-4">Use Cases</h2>
-//         <ul className="text-gray-400 space-y-3">
-//           <li>🎮 Game Designers – Rapid environment prototyping</li>
-//           <li>🎥 Animators – Generate background scenes instantly</li>
-//           <li>🏗️ Architects – Visualize concepts quickly</li>
-//           <li>🧠 AI Researchers – Test generative 3D capabilities</li>
-//         </ul>
-//       </section>
-
-//       <section id="Setup" className="min-h-[80vh] p-10 bg-gray-900">
-//         <h2 className="text-3xl font-semibold mb-4">Setup to use</h2>
-//         <ul className="text-gray-400 space-y-3">
-//           <li>How to Use?</li>
-//           <li></li>
-//           <li></li>
-//           <li></li>
-//         </ul>
-//       </section>
-//     </div>
-//   );
-// }
-
-
-
 import React from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
+import { useTheme } from "../context/ThemeContext";
 
 export default function HomePage() {
   const navigate = useNavigate();
   const { token } = useAuth();
+  const { theme, toggleTheme } = useTheme();
+  const isDark = theme === 'dark';
 
   const handleGetStarted = () => {
     if (token) {
@@ -116,21 +18,48 @@ export default function HomePage() {
   };
 
   return (
-    <div className="bg-black text-white flex flex-col justify-center items-center min-h-screen text-center">
-      <h1 className="text-5xl font-bold mb-6 tracking-wide">
-        Cursor for <span className="text-blue-400">3D</span>
-      </h1>
+    <div className="flex flex-col min-h-screen bg-slate-50 text-slate-900 dark:bg-gray-950 dark:text-slate-100 transition-colors">
+      {/* Theme Toggle Button */}
+      <div className="absolute top-4 right-4">
+        <button
+          type="button"
+          onClick={toggleTheme}
+          className="flex items-center justify-center w-10 h-10 rounded-full border border-slate-200 dark:border-gray-700 bg-white dark:bg-gray-900 text-slate-600 dark:text-slate-200 hover:border-blue-500 dark:hover:border-blue-400 transition-colors shadow-sm"
+          aria-label={`Switch to ${isDark ? 'light' : 'dark'} theme`}
+        >
+          {isDark ? (
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="currentColor" viewBox="0 0 20 20">
+              <path d="M10 2a1 1 0 011 1v1a1 1 0 11-2 0V3a1 1 0 011-1zm4.22 1.72a1 1 0 011.42 1.42l-.7.7a1 1 0 01-1.42-1.42l.7-.7zM17 9a1 1 0 110 2h-1a1 1 0 110-2h1zM5 10a1 1 0 01-1 1H3a1 1 0 010-2h1a1 1 0 011 1zm1.05-6.05a1 1 0 01.27 1.09l-.33.95a1 1 0 11-1.88-.64l.33-.95A1 1 0 016.05 3.95zM4.22 14.22a1 1 0 011.42 0l.7.7a1 1 0 11-1.42 1.42l-.7-.7a1 1 0 010-1.42zM10 16a1 1 0 011 1v1a1 1 0 11-2 0v-1a1 1 0 011-1zm5.78-1.78a1 1 0 111.42 1.42l-.7.7a1 1 0 11-1.42-1.42l.7-.7zM10 5a5 5 0 100 10A5 5 0 0010 5z" />
+            </svg>
+          ) : (
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="currentColor" viewBox="0 0 20 20">
+              <path d="M17.293 13.293A8 8 0 016.707 2.707a7 7 0 108.586 8.586z" />
+            </svg>
+          )}
+        </button>
+      </div>
 
-      <p className="text-gray-400 text-lg mb-10 max-w-md">
-        Generate and design Blender 3D scenes with the power of AI.
-      </p>
+      <main className="flex flex-col flex-1 justify-center items-center text-center px-4">
+      <img
+    src="C:\Users\sneha\Cursorfor3D-main\frontend\public\logo.png" // 🔹 replace with your logo path (e.g., "/assets/logo.png" or an imported image)
+    alt="Logo"
+    className="w-32 h-32 mb-6" // adjust size as needed
+  />
+        <h1 className="text-5xl font-bold mb-6 tracking-tight leading-tight">
+          Cursor for <span className="text-blue-600 dark:text-silver-400">3D</span>
+        </h1>
 
-      <button
-        onClick={handleGetStarted}
-        className="bg-blue-600 hover:bg-blue-700 px-8 py-3 rounded-full text-lg font-semibold transition-all"
-      >
-        Get Started →
-      </button>
+        <p className="text-slate-600 dark:text-slate-300 text-lg mb-10 max-w-xl">
+          Generate and design Blender 3D scenes with the power of AI.
+        </p>
+
+        <button
+          onClick={handleGetStarted}
+          className="bg-blue-600 hover:bg-blue-500 dark:hover:bg-blue-500 px-10 py-3 rounded-full text-lg font-semibold text-white shadow-md shadow-blue-600/20 transition-all"
+        >
+          Get Started →
+        </button>
+      </main>
     </div>
   );
 }
