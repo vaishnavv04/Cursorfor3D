@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAuth } from "../context/AuthContext";
+import { useTheme } from "../context/ThemeContext";
 
 import {
   FiMenu,
@@ -8,11 +9,17 @@ import {
   FiTrash2,
   FiMessageSquare,
   FiPlus,
+  FiFolder,
+  FiArchive,
 } from "react-icons/fi";
 
 
+const ATTACHMENT_CACHE_KEY = "cursorfor3d:attachment-cache";
+
 const ChatInterface = () => {
   const { token, user, logout, apiBase } = useAuth();
+  const { theme, toggleTheme } = useTheme();
+  const isDark = theme === "dark";
   const baseUrl = apiBase || "http://localhost:5000";
 
   const [conversations, setConversations] = useState([]);
@@ -39,7 +46,43 @@ const ChatInterface = () => {
   const fileInputRef = useRef(null);
 
   const [editingChatId, setEditingChatId] = useState(null);
-  const [editedName, setEditedName] = useState(""); 
+  const [editedName, setEditedName] = useState("");
+  const attachmentsCacheRef = useRef(new Map());
+  const [editingMessage, setEditingMessage] = useState(null);
+
+  const persistAttachmentDataUrl = useCallback((id, dataUrl) => {
+    if (!id || !dataUrl || typeof window === "undefined") return;
+    attachmentsCacheRef.current.set(id, dataUrl);
+    try {
+      const raw = window.localStorage.getItem(ATTACHMENT_CACHE_KEY);
+      const cache = raw ? JSON.parse(raw) : {};
+      cache[id] = dataUrl;
+      window.localStorage.setItem(ATTACHMENT_CACHE_KEY, JSON.stringify(cache));
+    } catch (err) {
+      console.warn("Failed to persist attachment preview", err);
+    }
+  }, []);
+
+  const loadAttachmentCacheFromStorage = useCallback(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const raw = window.localStorage.getItem(ATTACHMENT_CACHE_KEY);
+      if (!raw) return;
+      const cache = JSON.parse(raw);
+      if (!cache || typeof cache !== "object") return;
+      Object.entries(cache).forEach(([id, dataUrl]) => {
+        if (typeof dataUrl === "string" && dataUrl.startsWith("data:")) {
+          attachmentsCacheRef.current.set(id, dataUrl);
+        }
+      });
+    } catch (err) {
+      console.warn("Failed to load attachment preview cache", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadAttachmentCacheFromStorage();
+  }, [loadAttachmentCacheFromStorage]);
 
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -49,17 +92,31 @@ const ChatInterface = () => {
     scrollToBottom();
   }, [messages, scrollToBottom]);
 
-  const normalizeMessage = useCallback((message) => ({
-    id: message.id,
-    role: message.role,
-    content: message.content || "",
-    timestamp: message.createdAt || message.created_at || new Date().toISOString(),
-    provider: message.provider || message.metadata?.model || null,
-    blenderResult: message.blenderResult || message.blender_result || null,
-    sceneContext: message.sceneContext || message.scene_context || null,
-    enhancedPrompt: message.metadata?.enhancedPrompt || null,
-    metadata: message.metadata || {},
-  }), []);
+  const normalizeMessage = useCallback(
+    (message) => ({
+      id: message.id,
+      role: message.role,
+      content: message.content || "",
+      timestamp: message.createdAt || message.created_at || new Date().toISOString(),
+      provider: message.provider || message.metadata?.model || null,
+      blenderResult: message.blenderResult || message.blender_result || null,
+      sceneContext: message.sceneContext || message.scene_context || null,
+      enhancedPrompt: message.metadata?.enhancedPrompt || null,
+      metadata: message.metadata || {},
+      attachments: (message.metadata?.attachments || message.attachments || []).map((att) => {
+        const cachedDataUrl = attachmentsCacheRef.current.get(att.id);
+        const dataUrl = cachedDataUrl || att.dataUrl || null;
+        if (!cachedDataUrl && att.dataUrl) {
+          persistAttachmentDataUrl(att.id, att.dataUrl);
+        }
+        return {
+          ...att,
+          dataUrl,
+        };
+      }),
+    }),
+    [persistAttachmentDataUrl]
+  );
 
   const authorizedFetch = useCallback(
     async (path, options = {}) => {
@@ -176,6 +233,7 @@ const ChatInterface = () => {
         setShowEnhanced(false);
         setEnhancedPromptText("");
         setAttachments([]);
+        setEditingMessage(null);
       }
 
       try {
@@ -279,6 +337,7 @@ const handleNewChat = useCallback(async () => {
     setInput("");
     setAttachments([]);
     setActiveChat(conversation.id);
+    setEditingMessage(null);
   } catch (err) {
     console.error("Failed to start new chat", err);
     setError(err.message || "Unable to create new chat");
@@ -320,11 +379,11 @@ const handleNewChat = useCallback(async () => {
   }, [authorizedFetch, conversationId, input, enhancing, loading]);
 
   const handleSend = useCallback(async () => {
+    const originalInputValue = input;
     // Allow sending if there's text OR attachments
     if ((!input.trim() && attachments.length === 0) || loading) return;
 
     const rawPrompt = input.trim();
-    setInput("");
     setShowEnhanced(false);
     setEnhancedPromptText("");
     setError("");
@@ -343,6 +402,9 @@ const handleNewChat = useCallback(async () => {
       role: "user",
       content: effectivePrompt,
       timestamp: new Date().toISOString(),
+      attachments: attachments.map((att) => ({
+        ...att,
+      })),
     };
     setMessages((prev) => [...prev, tempMessage]);
     setLoading(true);
@@ -362,6 +424,9 @@ const handleNewChat = useCallback(async () => {
       const payloadAttachments = attachments.map(({ id, name, type, dataUrl, size }) => {
         if (!dataUrl) {
           console.warn('⚠️ Attachment missing dataUrl:', name);
+        }
+        if (dataUrl) {
+          persistAttachmentDataUrl(id, dataUrl);
         }
         return {
           id,
@@ -403,7 +468,30 @@ const handleNewChat = useCallback(async () => {
 
       setProgress(data.progress || []);
       setConversationId(data.conversationId);
-      setMessages((data.messages || []).map(normalizeMessage));
+      const normalized = (data.messages || []).map(normalizeMessage);
+      // Preserve local data URLs for attachments we still know about
+      normalized.forEach((msg) => {
+        if (msg.attachments && msg.attachments.length > 0) {
+          msg.attachments = msg.attachments.map((att) => ({
+            ...att,
+            dataUrl: att.dataUrl || attachmentsCacheRef.current.get(att.id) || null,
+          }));
+          msg.attachments.forEach((att) => {
+            if (att.dataUrl) {
+              persistAttachmentDataUrl(att.id, att.dataUrl);
+            }
+          });
+        }
+      });
+      setMessages(normalized);
+      // Update conversation title immediately if it was auto-renamed
+      if (data.conversationTitle && data.conversationId) {
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id === data.conversationId ? { ...c, title: data.conversationTitle } : c
+          )
+        );
+      }
       if (data.enhancedPrompt && data.enhancedPrompt !== rawPrompt) {
         setEnhancedPromptText(data.enhancedPrompt);
         setShowEnhanced(true);
@@ -411,10 +499,13 @@ const handleNewChat = useCallback(async () => {
         setShowEnhanced(false);
       }
       setAttachments([]);
+      setInput("");
+      setEditingMessage(null);
       fetchConversations();
     } catch (err) {
       console.error("Send error", err);
       setError(err.message || "Unable to generate response");
+      setInput(originalInputValue);
       setMessages((prev) => [
         ...prev.filter((msg) => !String(msg.id).startsWith("temp-")),
         {
@@ -439,10 +530,11 @@ const handleNewChat = useCallback(async () => {
     input,
     loading,
     normalizeMessage,
+    persistAttachmentDataUrl,
     selectedModel,
   ]);
 
-  const handleKeyPress = (e) => {
+  const handleKeyDown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -450,16 +542,34 @@ const handleNewChat = useCallback(async () => {
   };
 
   const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
-  const ACCEPTED_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp', 'application/pdf'];
+  const EXTENSION_MIME_MAP = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".pdf": "application/pdf",
+  };
+
+  const inferMimeTypeFromName = (name = "") => {
+    const lower = name.toLowerCase();
+    const match = Object.keys(EXTENSION_MIME_MAP).find((ext) => lower.endsWith(ext));
+    return match ? EXTENSION_MIME_MAP[match] : null;
+  };
 
   const validateFile = (file) => {
-    if (!file.type || (!file.type.startsWith("image/") && file.type !== "application/pdf")) {
-      return { valid: false, error: `${file.name} is not a supported file type. Please upload images (JPEG, PNG, GIF, WebP) or PDF.` };
+    const detectedType = (file.type || "").toLowerCase() || inferMimeTypeFromName(file.name);
+
+    if (!detectedType || (!detectedType.startsWith("image/") && detectedType !== "application/pdf")) {
+      return {
+        valid: false,
+        error: `${file.name} is not a supported file type. Please upload images (JPEG, PNG, GIF, WebP) or PDF.`,
+      };
     }
     if (file.size > MAX_FILE_SIZE) {
       return { valid: false, error: `${file.name} is too large. Maximum file size is 10MB.` };
     }
-    return { valid: true };
+    return { valid: true, detectedType };
   };
 
   const onAttachFiles = async (files) => {
@@ -473,7 +583,7 @@ const handleNewChat = useCallback(async () => {
     toArray.forEach((file) => {
       const validation = validateFile(file);
       if (validation.valid) {
-        validFiles.push(file);
+        validFiles.push({ file, detectedType: validation.detectedType || file.type });
       } else {
         errors.push(validation.error);
       }
@@ -496,14 +606,19 @@ const handleNewChat = useCallback(async () => {
 
     try {
       const loaded = await Promise.all(
-        validFiles.map(async (f) => ({
-          id: `${Date.now()}_${Math.random()}_${f.name}`,
-          name: f.name,
-          type: f.type,
-          size: f.size,
-          dataUrl: await readAsDataUrl(f),
+        validFiles.map(async ({ file, detectedType }) => ({
+          id: `${Date.now()}_${Math.random()}_${file.name}`,
+          name: file.name,
+          type: (detectedType || file.type || inferMimeTypeFromName(file.name) || "application/octet-stream"),
+          size: file.size,
+          dataUrl: await readAsDataUrl(file),
         }))
       );
+      loaded.forEach((att) => {
+        if (att.dataUrl) {
+          persistAttachmentDataUrl(att.id, att.dataUrl);
+        }
+      });
       setAttachments((prev) => [...prev, ...loaded]);
     } catch (err) {
       console.error("Error reading files:", err);
@@ -536,6 +651,49 @@ const handleNewChat = useCallback(async () => {
 
   const removeAttachment = (id) => setAttachments((prev) => prev.filter((a) => a.id !== id));
 
+  const cancelEditing = useCallback(() => {
+    setEditingMessage(null);
+  }, []);
+
+  const handleEditPrompt = useCallback(
+    (message) => {
+      if (!message) return;
+      const restoredAttachments =
+        (message.attachments || []).map((att) => {
+          const dataUrl = att.dataUrl || attachmentsCacheRef.current.get(att.id) || null;
+          return { ...att, dataUrl };
+        }) || [];
+
+      const availableAttachments = restoredAttachments.filter((att) => !!att.dataUrl);
+      setInput(message.content || "");
+      if (availableAttachments.length !== restoredAttachments.length) {
+        setError("Some attachments could not be restored. Please reattach missing files before sending.");
+      } else {
+        setError("");
+      }
+      setAttachments(availableAttachments);
+      availableAttachments.forEach((att) => {
+        if (att.dataUrl) {
+          persistAttachmentDataUrl(att.id, att.dataUrl);
+        }
+      });
+      setShowEnhanced(false);
+      setEnhancedPromptText("");
+      setEditingMessage({
+        id: message.id,
+        content: message.content || "",
+        attachments: restoredAttachments.map((att) => ({
+          id: att.id,
+          name: att.name,
+        })),
+      });
+      requestAnimationFrame(() => {
+        inputRef.current?.focus();
+      });
+    },
+    [persistAttachmentDataUrl, setError]
+  );
+
   const handleDeleteConversation = useCallback(
     async (id) => {
       try {
@@ -560,215 +718,309 @@ const handleNewChat = useCallback(async () => {
   }, [handleDeleteConversation]);
 
 
+  const primaryNav = useMemo(
+    () => [
+      { id: "chats", label: "Chats", icon: FiMessageSquare },
+    ],
+    []
+  );
+
+  const sharedGradient = isDark
+    ? "bg-gradient-to-b from-[#1c1d26] via-[#12131a] to-[#08090f]"
+    : "bg-gradient-to-b from-[#f5f6fb] via-[#e6e9f5] to-[#d8dcee]";
+
+  const pageGradient = `${sharedGradient} ${isDark ? "text-slate-100" : "text-slate-900"}`;
+
+  const sidebarBackground = `${sharedGradient} ${isDark ? "text-white" : "text-slate-900"}`;
+  const overlayGradient = `${sharedGradient} ${isDark
+    ? "bg-[radial-gradient(circle_at_top,_rgba(94,92,228,0.25),_transparent_60%)]"
+    : "bg-[radial-gradient(circle_at_top,_rgba(128,146,255,0.25),_transparent_60%)]"}`;
+
+  const pillBackground = isDark ? "bg-white/5 text-slate-200" : "bg-slate-100 text-slate-600";
+
+  const recentInactiveClasses = isDark
+    ? "text-slate-300 hover:bg-white/5 hover:text-white"
+    : "text-slate-600 hover:bg-slate-100/80 hover:text-slate-900";
+
+  const recentActiveClasses = isDark ? "bg-white/10 text-white" : "bg-slate-200/90 text-slate-900";
+
+  const footerText = isDark ? "text-slate-400" : "text-slate-500";
+  const footerAvatarBg = isDark ? "bg-white/10 text-white" : "bg-slate-200 text-slate-700";
+
+  const logoutButtonClasses = isDark
+    ? "text-sm font-medium text-white hover:text-gray-300 transition-colors"
+    : "text-sm font-medium text-slate-700 hover:text-slate-900 transition-colors";
+
+  const headerBorder = isDark ? "border-white/5" : "border-slate-200/80";
+  const navActiveClasses = isDark
+    ? "bg-white/5 text-white shadow-inner shadow-white/10"
+    : "bg-slate-200/80 text-slate-900 shadow-inner shadow-slate-300/60";
+  const navInactiveClasses = isDark
+    ? "text-slate-300 hover:bg-white/5 hover:text-white"
+    : "text-slate-600 hover:bg-slate-100 hover:text-slate-900";
+
+  const navIconWrapper = isDark ? "bg-white/5 text-slate-200" : "bg-slate-100 text-slate-600";
+
+  const newChatGradient = isDark
+    ? "from-pink-500 to-purple-500 hover:from-pink-400 hover:to-purple-400"
+    : "from-pink-400 to-purple-400 hover:from-pink-300 hover:to-purple-300";
+
   return (
-    <div className="flex h-screen bg-[#0a0a0a] text-white">
+    <div className={`flex h-screen transition-colors ${pageGradient}`}>
       <aside
-       className={`${
-       collapsed ? "w-16" : "w-72"
-        } bg-[#0b0b0b] border-r border-gray-900/80 flex flex-col transition-all duration-300`}
-        >
-        {/* Header */}
-      <div className="flex items-center justify-between p-4 border-b border-gray-900/80">
-      <div className="flex items-center gap-2">
-      <img
-        src="C:\Users\sneha\Cursorfor3D-main\frontend\build\logo.png"
-        alt="CursorFor3D"
-        className={`${collapsed ? "hidden" : "block"} w-6 h-6 rounded`}
-      />
-      {!collapsed && (
-        <span className="text-blue-300 font-semibold text-sm">
-          CursorFor3D
-        </span>
-      )}
-    </div>
-    <button
-      onClick={() => setCollapsed(!collapsed)}
-      className="text-gray-400 hover:text-white transition"
-    >
-      <FiMenu size={18} />
-    </button>
-  </div>
-
-  {/* New Chat */}
-  <div className="p-3 border-b border-gray-900/80">
-    <button
-      onClick={handleNewChat}
-      className="w-full flex items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 px-3 py-2 text-sm font-medium"
-    >
-      <FiPlus />
-      {!collapsed && "New Chat"}
-    </button>
-  </div>
-
-  {/* Conversations */}
-  <div className="flex-1 overflow-y-auto px-2 py-3 space-y-1">
-    {conversationsLoading ? (
-      <p
-        className={`text-xs text-gray-600 px-2 ${
-          collapsed ? "text-center" : ""
-        }`}
+        className={`${
+          collapsed ? "w-16" : "w-60"
+        } relative flex h-full flex-col ${sidebarBackground} transition-all duration-300`}
       >
-        Loading…
-      </p>
-    ) : conversations.length === 0 ? (
-      <p
-        className={`text-xs text-gray-600 px-2 ${
-          collapsed ? "text-center" : ""
-        }`}
-      >
-        No threads yet
-      </p>
-    ) : (
-      conversations.map((chat) => (
-        <div
-          key={chat.id}
-          className={`group flex items-center justify-between px-2 py-2 rounded-lg cursor-pointer transition ${
-            activeChat === chat.id
-              ? "bg-gray-800/70 text-white"
-              : "text-gray-400 hover:bg-gray-900/70 hover:text-white"
-          }`}
-          onClick={() => {
-            setActiveChat(chat.id);
-            loadConversation(chat.id);
-          }}
-        >
-          <div className="flex items-center gap-2 truncate flex-1 min-w-0">
-            <FiMessageSquare
-              className="text-gray-500 flex-shrink-0"
-              size={16}
-            />
-            
-            {!collapsed && (
-              editingChatId === chat.id ? (
-                <input
-                  type="text"
-                  value={editedName}
-                  onChange={(e) => setEditedName(e.target.value)}
-                  onBlur={() => handleRename(chat.id, editedName)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      handleRename(chat.id, editedName);
-                    } else if (e.key === "Escape") {
-                      setEditingChatId(null);
-                      setEditedName("");
-                    }
-                  }}
-                  onClick={(e) => e.stopPropagation()}
-                  className="flex-1 bg-gray-800 text-white text-sm px-2 py-1 rounded border border-gray-600 focus:outline-none focus:border-pink-500"
-                  autoFocus
-                />
-              ) : (
-                <span className="truncate text-sm text-gray-200">{chat.title || "Untitled"}</span>
-              )
-            )}
+        <div className={`absolute inset-0 ${overlayGradient} pointer-events-none`} />
+        <div className="relative flex h-full flex-col">
+          {/* Header */}
+          <div className={`flex items-center justify-between border-b ${headerBorder} px-6 py-3`}>
+            <div className="flex items-center gap-3">
+              {!collapsed && (
+                <div className="flex flex-col gap-1">
+                  <span
+                    className={`text-xs uppercase tracking-wider ${
+                      isDark ? "text-slate-400" : "text-slate-500"
+                    }`}
+                  >
+                    Dashboard
+                  </span>
+                  <span className={`text-lg font-semibold ${isDark ? "text-white" : "text-slate-900"}`}>
+                    CursorFor3D
+                  </span>
+                </div>
+              )}
+            </div>
+            <button
+              onClick={() => setCollapsed((prev) => !prev)}
+              className={`rounded-full border ${isDark ? "border-white/10 text-slate-300 hover:border-white/30 hover:text-white" : "border-slate-200 text-slate-500 hover:border-slate-400 hover:text-slate-700"} p-2 transition`}
+              aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+            >
+              <FiMenu size={14} />
+            </button>
           </div>
 
-          {/* Hover actions */}
-          {!collapsed && editingChatId !== chat.id && (
-            <div className="hidden group-hover:flex gap-2 text-gray-500">
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleRenameChat(chat.id);
-                }}
-                className="hover:text-pink-400"
-              >
-                <FiEdit2 size={14} />
-              </button>
-              <button
-                onClick={(e) => {
-                  handleShareChat(chat.id, e);
-                }}
-                className="hover:text-purple-400"
-              >
-                <FiShare2 size={14} />
-              </button>
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleDeleteChat(chat.id);
-                }}
-                className="hover:text-red-400"
-              >
-                <FiTrash2 size={14} />
-              </button>
-            </div>
-          )}
-        </div>
-      ))
-    )}
-  </div>
+          {/* New Chat */}
+          <div className={`border-b ${headerBorder} px-3 py-3`}>
+            <button
+              onClick={handleNewChat}
+              className={`w-full rounded-lg bg-gradient-to-r ${newChatGradient} px-3 py-2 text-sm font-semibold text-white shadow-[0_12px_32px_rgba(201,67,55,0.25)] transition`}
+            >
+              <div className="flex items-center justify-center gap-3">
+                <span
+                  className={`flex h-4 w-4 items-center justify-center rounded-full ${
+                    isDark ? "bg-white/10" : "bg-white/70 text-pink-500"
+                  }`}
+                >
+                  <FiPlus size={14} />
+                </span>
+                {!collapsed && <span>New chat</span>}
+              </div>
+            </button>
+          </div>
 
-  {/* Footer */}
-  <div className="border-t border-gray-900/80 p-4 text-sm text-gray-400">
-    {!collapsed && (
-      <>
-        <div className="text-xs text-gray-500 truncate mb-2">
-          {user?.email}
+          {/* Primary nav */}
+          <nav className="px-2 py-5">
+            <div className="space-y-1">
+              {primaryNav.map(({ id, label, icon: Icon }) => (
+                <button
+                  key={id}
+                  type="button"
+                  className={`group flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition ${
+                    id === "chats"
+                      ? navActiveClasses
+                      : navInactiveClasses
+                  }`}
+                >
+                  <span className={`flex h-8 w-8 items-center justify-center rounded-md ${navIconWrapper}`}>
+                    <Icon size={16} />
+                  </span>
+                  {!collapsed && <span>{label}</span>}
+                </button>
+              ))}
+            </div>
+          </nav>
+
+          {/* Recents */}
+          <div className="flex-1 overflow-y-auto px-2 pb-4">
+            {!collapsed && (
+              <div
+                className={`px-2 pb-2 text-xs font-semibold uppercase tracking-wider ${
+                  isDark ? "text-slate-500" : "text-slate-600"
+                }`}
+              >
+                Recents
+              </div>
+            )}
+            <div className="space-y-1">
+              {conversationsLoading ? (
+                <div className="px-3 py-2 text-xs text-slate-500">Loading…</div>
+              ) : conversations.length === 0 ? (
+                <div className="px-3 py-2 text-xs text-slate-500">No conversations yet</div>
+              ) : (
+                conversations.map((chat) => (
+                  <div
+                    key={chat.id}
+                    className={`group rounded-lg px-3 py-2 text-left text-sm transition ${
+                      activeChat === chat.id ? recentActiveClasses : recentInactiveClasses
+                    }`}
+                    onClick={() => {
+                      setActiveChat(chat.id);
+                      loadConversation(chat.id);
+                    }}
+                    role="button"
+                    tabIndex={0}
+                  >
+                    <div className="flex items-center gap-3">
+                      <span className={`flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-md ${navIconWrapper}`}>
+                        <FiMessageSquare size={15} />
+                      </span>
+                      {!collapsed && (
+                        <div className="flex min-w-0 flex-1 items-center gap-2">
+                          <div className="flex-1 truncate">
+                            {editingChatId === chat.id ? (
+                              <input
+                                type="text"
+                                value={editedName}
+                                onChange={(e) => setEditedName(e.target.value)}
+                                onBlur={() => handleRename(chat.id, editedName)}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") {
+                                    e.preventDefault();
+                                    handleRename(chat.id, editedName);
+                                  } else if (e.key === "Escape") {
+                                    setEditingChatId(null);
+                                    setEditedName("");
+                                  }
+                                }}
+                                onClick={(e) => e.stopPropagation()}
+                                className={`w-full rounded-md border ${
+                                  isDark
+                                    ? "border-white/20 bg-transparent text-white placeholder:text-slate-400 focus:border-white/40"
+                                    : "border-slate-200 bg-white text-slate-800 placeholder:text-slate-400 focus:border-slate-400"
+                                } px-2 py-1 text-sm focus:outline-none`}
+                                autoFocus
+                              />
+                            ) : (
+                              <span className="truncate">{chat.title || "Untitled chat"}</span>
+                            )}
+                          </div>
+                          {editingChatId !== chat.id && (
+                            <div
+                              className={`flex flex-shrink-0 items-center gap-2 text-xs ${
+                                isDark ? "text-slate-400" : "text-slate-500"
+                              } opacity-0 transition group-hover:opacity-100`}
+                            >
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleRenameChat(chat.id);
+                                }}
+                                className={isDark ? "hover:text-white" : "hover:text-slate-900"}
+                              >
+                                <FiEdit2 size={12} />
+                              </button>
+                              <button
+                                onClick={(e) => {
+                                  handleShareChat(chat.id, e);
+                                }}
+                                className={isDark ? "hover:text-white" : "hover:text-slate-900"}
+                              >
+                                <FiShare2 size={12} />
+                              </button>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleDeleteChat(chat.id);
+                                }}
+                                className={isDark ? "hover:text-red-300" : "hover:text-red-500"}
+                              >
+                                <FiTrash2 size={12} />
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          {/* Footer */}
+          <div className={`border-t ${headerBorder} px-4 py-5 text-xs ${footerText}`}>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className={`flex h-9 w-9 items-center justify-center rounded-full ${footerAvatarBg} text-sm font-semibold uppercase`}>
+                  {user?.email?.[0] || "U"}
+                </div>
+                {!collapsed && (
+                  <div className="flex flex-col">
+                    <span className={`text-sm font-medium ${isDark ? "text-white" : "text-slate-800"}`}>
+                      {user?.email || "Signed in"}
+                    </span>
+                    <button
+                      onClick={logout}
+                      className={logoutButtonClasses}
+                    >
+                     Log out
+                    </button>
+                    
+                  </div>
+                )}
+              </div>
+              {/* {!collapsed && (
+                <button
+                  onClick={logout}
+                  className={logoutButtonClasses}
+                >
+                  Log out
+                </button>
+              )} */}
+            </div>
+          </div>
         </div>
-        <button
-          onClick={logout}
-          className="text-left text-sm text-gray-400 hover:text-white"
-        >
-          Log out
-        </button>
-      </>
-    )}
-  </div>
-</aside>
+      </aside>
 
 
       <div className="flex-1 flex flex-col">
-        <div className="border-b border-gray-900/80 px-6 py-3 flex items-center justify-between">
+        <div className="border-b border-slate-200 dark:border-gray-900/80 px-6 py-3 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <h1 className="text-lg font-semibold text-white">How can I help you?</h1>
-            <span className="text-xs text-gray-500 px-2 py-1 rounded bg-gray-900/60">
+            <h1 className="text-lg font-semibold text-slate-900 dark:text-white">Hello! How can I help you?</h1>
+            <span className="text-xs text-slate-600 dark:text-gray-400 px-2 py-1 rounded bg-slate-200/80 dark:bg-gray-900/60">
               {conversationId ? "Active" : "New Chat"}
             </span>
           </div>
-          <div className="text-xs text-gray-400">
-            Model: gemini-2.5-flash
+          <div className="flex items-center gap-3 text-xs text-slate-500 dark:text-gray-400">
+            <span>Model: gemini-2.5-flash</span>
+            <button
+              type="button"
+              onClick={toggleTheme}
+              className="flex items-center justify-center w-9 h-9 rounded-full border border-slate-200 dark:border-gray-700 bg-white dark:bg-gray-900 text-slate-600 dark:text-slate-200 hover:border-blue-500 dark:hover:border-blue-400 transition-colors"
+              aria-label={`Switch to ${isDark ? "light" : "dark"} theme`}
+            >
+              {isDark ? (
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="currentColor" viewBox="0 0 20 20">
+                  <path d="M10 2a1 1 0 011 1v1a1 1 0 11-2 0V3a1 1 0 011-1zm4.22 1.72a1 1 0 011.42 1.42l-.7.7a1 1 0 01-1.42-1.42l.7-.7zM17 9a1 1 0 110 2h-1a1 1 0 110-2h1zM5 10a1 1 0 01-1 1H3a1 1 0 010-2h1a1 1 0 011 1zm1.05-6.05a1 1 0 01.27 1.09l-.33.95a1 1 0 11-1.88-.64l.33-.95A1 1 0 016.05 3.95zM4.22 14.22a1 1 0 011.42 0l.7.7a1 1 0 11-1.42 1.42l-.7-.7a1 1 0 010-1.42zM10 16a1 1 0 011 1v1a1 1 0 11-2 0v-1a1 1 0 011-1zm5.78-1.78a1 1 0 111.42 1.42l-.7.7a1 1 0 11-1.42-1.42l.7-.7zM10 5a5 5 0 100 10A5 5 0 0010 5z" />
+                </svg>
+              ) : (
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="currentColor" viewBox="0 0 20 20">
+                  <path d="M17.293 13.293A8 8 0 016.707 2.707a7 7 0 108.586 8.586z" />
+                </svg>
+              )}
+            </button>
           </div>
         </div>
 
         <div className="flex-1 overflow-y-auto px-6 py-6 space-y-6">
-          {/* Progress timeline */}
-          {progress && progress.length > 0 && (
-            <div className="max-w-3xl mx-auto mb-6">
-              <div className="mb-2 flex items-center gap-2">
-                <h2 className="text-xs font-semibold tracking-wide text-gray-400 uppercase">Process</h2>
-                <span className="text-[10px] px-2 py-0.5 rounded bg-gray-800/60 text-gray-500">{progress.length} step{progress.length!==1?'s':''}</span>
-              </div>
-              <ol className="space-y-1">
-                {progress.map((p, i) => (
-                  <li key={i} className="flex items-start gap-2 text-xs text-gray-300">
-                    <span className="w-16 text-[10px] text-gray-500">{new Date(p.ts).toLocaleTimeString()}</span>
-                    <div className="flex-1 flex flex-col">
-                      <div className="flex items-center gap-2">
-                        <span className="px-1.5 py-0.5 rounded bg-gray-800/50 text-[10px] text-gray-400 font-mono">{p.step}</span>
-                        <span className="text-gray-200">{p.message}</span>
-                      </div>
-                      {p.data && (
-                        <pre className="mt-1 max-h-40 overflow-auto bg-gray-950/40 rounded p-2 text-[10px] text-gray-400 border border-gray-800/50">
-                          {JSON.stringify(p.data, null, 2)}
-                        </pre>
-                      )}
-                      {p.error && (
-                        <span className="mt-1 text-[10px] text-red-400">{p.error}</span>
-                      )}
-                    </div>
-                  </li>
-                ))}
-              </ol>
-            </div>
-          )}
           {messagesLoading ? (
-            <div className="flex items-center justify-center h-full text-gray-500">Loading conversation…</div>
+            <div className="flex items-center justify-center h-full text-slate-500 dark:text-gray-500">Loading conversation…</div>
           ) : messages.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-full text-center px-4">
               <div className="mb-6">
-                <div className="w-16 h-16 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center mb-4">
+                <div className="w-16 h-16 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center mb-4 shadow-lg shadow-blue-500/30">
                   <svg className="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path
                       strokeLinecap="round"
@@ -779,8 +1031,8 @@ const handleNewChat = useCallback(async () => {
                   </svg>
                 </div>
               </div>
-              <h2 className="text-2xl font-semibold mb-2 text-white">Create 3D Scenes with AI</h2>
-              <p className="text-gray-400 max-w-md mb-8">
+              <h2 className="text-2xl font-semibold mb-2 text-slate-900 dark:text-white">Create 3D Scenes with AI</h2>
+              <p className="text-slate-600 dark:text-gray-400 max-w-md mb-8">
                 Describe what you want to create, and I'll generate Blender Python code to bring it to life.
                 You can refine and iterate on your creations through conversation.
               </p>
@@ -789,7 +1041,7 @@ const handleNewChat = useCallback(async () => {
                   <button
                     key={idx}
                     onClick={() => setInput(suggestion)}
-                    className="px-4 py-3 rounded-lg bg-gray-800/50 hover:bg-gray-800 border border-gray-700/50 text-left text-sm text-gray-300 hover:text-white transition-colors"
+                    className="px-4 py-3 rounded-lg bg-white border border-slate-200 text-left text-sm text-slate-600 hover:bg-slate-100 hover:text-slate-900 transition-colors dark:bg-gray-800/50 dark:border-gray-700/50 dark:text-gray-300 dark:hover:bg-gray-800 dark:hover:text-white"
                   >
                     {suggestion}
                   </button>
@@ -814,41 +1066,78 @@ const handleNewChat = useCallback(async () => {
                 <div
                   className={`max-w-3xl rounded-2xl px-5 py-4 ${
                     message.role === "user"
-                      ? "bg-blue-600 text-white"
+                      ? "bg-blue-600 text-white shadow-lg shadow-blue-500/30"
                       : message.isError
-                      ? "bg-red-900/20 border border-red-800/50 text-red-200"
-                      : "bg-gray-800/80 border border-gray-700/50 text-gray-100"
+                      ? "bg-red-50 text-red-700 border border-red-200 dark:bg-red-900/20 dark:border-red-800/50 dark:text-red-200"
+                      : "bg-white border border-slate-200 text-slate-800 dark:bg-gray-800/80 dark:border-gray-700/50 dark:text-gray-100"
                   }`}
                 >
                   {message.role === "user" ? (
-                    <p className="whitespace-pre-wrap">{message.content}</p>
+                    <div className="space-y-3">
+                      <div className="flex items-start justify-between gap-3">
+                        <p className="whitespace-pre-wrap break-words flex-1">{message.content}</p>
+                        <button
+                          onClick={() => handleEditPrompt(message)}
+                          className="text-blue-100/70 hover:text-white transition-colors"
+                          title="Edit and resend this prompt"
+                        >
+                          <FiEdit2 size={16} />
+                        </button>
+                      </div>
+                      {message.attachments && message.attachments.length > 0 && (
+                        <div className="flex gap-3 flex-wrap">
+                          {message.attachments.map((att) => (
+                            <div
+                              key={att.id}
+                              className="border border-blue-200/40 bg-blue-500/10 rounded-lg overflow-hidden"
+                              style={{ maxWidth: 160 }}
+                            >
+                              {att.dataUrl ? (
+                                att.type?.startsWith("image/") ? (
+                                  <img src={att.dataUrl} alt={att.name} className="w-full h-24 object-cover" />
+                                ) : (
+                                  <div className="w-40 h-24 flex items-center justify-center text-xs text-blue-100 px-2">
+                                    <span className="text-center">Attachment</span>
+                                  </div>
+                                )
+                              ) : (
+                                <div className="w-40 h-24 flex items-center justify-center text-xs text-blue-100 px-2">
+                                  <span className="text-center">Reattach to preview</span>
+                                </div>
+                              )}
+                              <div className="px-2 py-1 bg-blue-900/20 text-xs text-blue-100 truncate">{att.name}</div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                   ) : (
                     <div className="space-y-4">
                       {message.enhancedPrompt && message.enhancedPrompt !== message.content && (
-                        <div className="mb-3 p-3 rounded-lg bg-blue-900/20 border border-blue-800/50">
-                          <p className="text-xs text-blue-300 mb-1 font-medium">Enhanced Prompt:</p>
-                          <p className="text-sm text-blue-200">{message.enhancedPrompt}</p>
+                        <div className="mb-3 p-3 rounded-lg bg-blue-50 border border-blue-200 text-blue-700 dark:bg-blue-900/20 dark:border-blue-800/50 dark:text-blue-200">
+                          <p className="text-xs mb-1 font-medium text-blue-600 dark:text-blue-300">Enhanced Prompt:</p>
+                          <p className="text-sm text-inherit">{message.enhancedPrompt}</p>
                         </div>
                       )}
                       {message.sceneContext && (
-                        <div className="mb-3 p-3 rounded-lg bg-purple-900/20 border border-purple-800/50">
-                          <p className="text-xs text-purple-300 mb-1 font-medium">Scene Context:</p>
-                          <p className="text-sm text-purple-200">
+                        <div className="mb-3 p-3 rounded-lg bg-purple-50 border border-purple-200 text-purple-700 dark:bg-purple-900/20 dark:border-purple-800/50 dark:text-purple-200">
+                          <p className="text-xs text-purple-600 dark:text-purple-300 mb-1 font-medium">Scene Context:</p>
+                          <p className="text-sm text-inherit">
                             {message.sceneContext.objects?.length || 0} objects in scene
                           </p>
                         </div>
                       )}
                       {message.provider && (
                         <div className="mb-2">
-                          <span className="text-xs px-2 py-1 rounded-full bg-gray-700/50 text-gray-400">
+                          <span className="text-xs px-2 py-1 rounded-full bg-slate-200 text-slate-600 dark:bg-gray-700/50 dark:text-gray-400">
                             {message.provider.toUpperCase()}
                           </span>
                         </div>
                       )}
                       {message.blenderResult && (
-                        <div className="mb-3 p-3 rounded-lg bg-green-900/20 border border-green-800/50">
-                          <p className="text-xs text-green-300 mb-1 font-medium">Blender Status:</p>
-                          <p className="text-sm text-green-200">
+                        <div className="mb-3 p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 dark:bg-green-900/20 dark:border-green-800/50 dark:text-green-200">
+                          <p className="text-xs text-emerald-600 dark:text-green-300 mb-1 font-medium">Blender Status:</p>
+                          <p className="text-sm text-inherit">
                             {message.blenderResult.error
                               ? `Error: ${message.blenderResult.error}`
                               : message.blenderResult.message || "Code executed successfully"}
@@ -857,9 +1146,9 @@ const handleNewChat = useCallback(async () => {
                       )}
                       {message.content && (
                         <div>
-                          <p className="text-xs text-gray-400 mb-2 font-medium">Generated Code:</p>
-                          <pre className="text-xs bg-gray-900/50 rounded-lg p-3 overflow-x-auto border border-gray-700/30">
-                            <code className="text-gray-300">{message.content}</code>
+                          <p className="text-xs text-slate-500 dark:text-gray-400 mb-2 font-medium">Generated Code:</p>
+                          <pre className="text-xs bg-slate-100 rounded-lg p-3 overflow-x-auto border border-slate-200 dark:bg-gray-900/50 dark:border-gray-700/30">
+                            <code className="text-slate-800 dark:text-gray-300">{message.content}</code>
                           </pre>
                         </div>
                       )}
@@ -870,8 +1159,8 @@ const handleNewChat = useCallback(async () => {
                   </p>
                 </div>
                 {message.role === "user" && (
-                  <div className="w-8 h-8 rounded-full bg-gray-700 flex items-center justify-center flex-shrink-0">
-                    <svg className="w-5 h-5 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <div className="w-8 h-8 rounded-full bg-slate-200 text-slate-600 dark:bg-gray-700 dark:text-gray-300 flex items-center justify-center flex-shrink-0">
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
                     </svg>
                   </div>
@@ -886,7 +1175,7 @@ const handleNewChat = useCallback(async () => {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                 </svg>
               </div>
-              <div className="bg-gray-800/80 border border-gray-700/50 rounded-2xl px-5 py-4">
+              <div className="bg-white border border-slate-200 rounded-2xl px-5 py-4 shadow-sm dark:bg-gray-800/80 dark:border-gray-700/50">
                 <div className="flex gap-2">
                   <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce" style={{ animationDelay: "0ms" }}></div>
                   <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce" style={{ animationDelay: "150ms" }}></div>
@@ -895,18 +1184,18 @@ const handleNewChat = useCallback(async () => {
               </div>
             </div>
           )}
-          {error && <p className="text-sm text-red-400">{error}</p>}
+          {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
           <div ref={messagesEndRef} />
         </div>
 
         {showEnhanced && enhancedPromptText && (
-          <div className="px-6 py-3 border-t border-gray-800/50 bg-gray-900/30">
+          <div className="px-6 py-3 border-t border-slate-200 bg-slate-100 dark:border-gray-800/50 dark:bg-gray-900/30">
             <div className="max-w-4xl mx-auto flex items-start gap-3">
               <div className="flex-1">
-                <p className="text-xs text-blue-400 mb-1 font-medium">Enhanced Prompt:</p>
-                <p className="text-sm text-gray-300">{enhancedPromptText}</p>
+                <p className="text-xs text-blue-600 dark:text-blue-400 mb-1 font-medium">Enhanced Prompt:</p>
+                <p className="text-sm text-slate-700 dark:text-gray-300">{enhancedPromptText}</p>
               </div>
-              <button onClick={() => setShowEnhanced(false)} className="text-gray-500 hover:text-gray-300 transition-colors">
+              <button onClick={() => setShowEnhanced(false)} className="text-slate-500 hover:text-slate-700 dark:text-gray-500 dark:hover:text-gray-300 transition-colors">
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                 </svg>
@@ -916,36 +1205,52 @@ const handleNewChat = useCallback(async () => {
         )}
 
         <div 
-          className="border-t border-gray-900/80 px-6 py-4 bg-[#0a0a0a]"
+          className="border-t border-slate-200 bg-slate-500 px-6 py-4 dark:border-gray-900/80 dark:bg-[#050816]"
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
           onDrop={handleDrop}
         >
           <div className="max-w-4xl mx-auto">
+            {editingMessage && (
+              <div className="mb-3 flex items-center justify-between gap-3 px-3 py-2 rounded-lg bg-pink-50 border border-pink-200 text-xs text-pink-700 dark:bg-pink-500/10 dark:border-pink-500/30 dark:text-pink-200">
+                <span className="truncate">
+                  Editing previous prompt
+                  {editingMessage.content
+                    ? `: "${editingMessage.content.slice(0, 60)}${editingMessage.content.length > 60 ? "..." : ""}"`
+                    : ""}
+                </span>
+                <button
+                  onClick={cancelEditing}
+                  className="text-pink-600 hover:text-pink-500 dark:text-pink-200 dark:hover:text-white transition-colors"
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
             {attachments.length > 0 && (
               <div className="flex gap-3 flex-wrap mb-3">
                 {attachments.map((att) => (
-                  <div key={att.id} className="group relative border border-gray-800 rounded-lg overflow-hidden bg-gray-900/60">
+                  <div key={att.id} className="group relative border border-slate-200 rounded-lg overflow-hidden bg-slate-100 dark:border-gray-800 dark:bg-gray-900/60">
                     {att.type.startsWith("image/") ? (
                       <div className="relative">
                         <img src={att.dataUrl} alt={att.name} className="h-24 w-24 object-cover" />
                         <div className="absolute bottom-0 left-0 right-0 bg-black/70 px-1 py-0.5">
                           <p className="text-xs text-white truncate">{att.name}</p>
-                          <p className="text-xs text-gray-400">{(att.size / 1024).toFixed(1)} KB</p>
+                          <p className="text-xs text-gray-300">{(att.size / 1024).toFixed(1)} KB</p>
                         </div>
                       </div>
                     ) : (
-                      <div className="h-24 w-32 flex flex-col items-center justify-center text-xs text-gray-300 px-2">
+                      <div className="h-24 w-32 flex flex-col items-center justify-center text-xs text-slate-600 dark:text-gray-300 px-2">
                         <svg className="w-8 h-8 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
                         </svg>
                         <p className="truncate text-center w-full">{att.name}</p>
-                        <p className="text-gray-400">{(att.size / 1024).toFixed(1)} KB</p>
+                        <p className="text-slate-500 dark:text-gray-400">{(att.size / 1024).toFixed(1)} KB</p>
                       </div>
                     )}
                     <button
                       onClick={() => removeAttachment(att.id)}
-                      className="absolute top-1 right-1 hidden group-hover:block text-white hover:text-red-400 bg-red-600/80 rounded-full p-1 transition-colors"
+                      className="absolute top-1 right-1 hidden group-hover:block text-white hover:text-red-200 bg-red-600/80 rounded-full p-1 transition-colors"
                       title="Remove attachment"
                     >
                       <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -972,30 +1277,30 @@ const handleNewChat = useCallback(async () => {
                   ref={inputRef}
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
-                  onKeyPress={handleKeyPress}
+                  onKeyDown={handleKeyDown}
                   placeholder="Describe what you want to create..."
                   rows={1}
-                  className="w-full px-4 py-3 pr-32 rounded-xl bg-gray-900/80 border border-gray-800 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-pink-600/40 focus:border-pink-600/40 resize-none max-h-32 overflow-y-auto"
+                  className="w-full px-4 py-3 pr-32 rounded-xl bg-white border border-slate-200 text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-pink-600/40 focus:border-pink-600/40 resize-none max-h-32 overflow-y-auto dark:bg-gray-900/80 dark:border-gray-800 dark:text-white dark:placeholder-gray-500"
                   style={{ minHeight: "48px" }}
                 />
                 <button
                   onClick={handleEnhancePrompt}
                   disabled={!input.trim() || enhancing || loading}
-                  className="absolute right-24 bottom-2 p-2 rounded-lg bg-gray-800 hover:bg-gray-700 disabled:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-50 transition-colors"
+                  className="absolute right-24 bottom-2 p-2 rounded-lg bg-slate-100 border border-slate-200 text-slate-600 hover:bg-slate-200 disabled:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50 transition-colors dark:bg-gray-800 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-gray-700"
                   title="Enhance prompt"
                 >
                   {enhancing ? (
-                    <svg className="w-5 h-5 text-gray-200 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <svg className="w-5 h-5 text-slate-600 dark:text-gray-200 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                     </svg>
                   ) : (
-                    <svg className="w-5 h-5 text-gray-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <svg className="w-5 h-5 text-slate-600 dark:text-gray-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
                     </svg>
                   )}
                 </button>
                 <label 
-                  className="absolute right-12 bottom-2 p-2 rounded-lg bg-gray-800 hover:bg-gray-700 cursor-pointer transition-colors"
+                  className="absolute right-12 bottom-2 p-2 rounded-lg bg-slate-100 border border-slate-200 text-slate-600 hover:bg-slate-200 cursor-pointer transition-colors dark:bg-gray-800 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-gray-700"
                   title="Upload images or PDFs"
                 >
                   <input 
@@ -1012,7 +1317,7 @@ const handleNewChat = useCallback(async () => {
                       }
                     }} 
                   />
-                  <svg className="w-5 h-5 text-gray-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <svg className="w-5 h-5 text-slate-600 dark:text-gray-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
                   </svg>
                 </label>
@@ -1027,9 +1332,9 @@ const handleNewChat = useCallback(async () => {
                 </button>
               </div>
             </div>
-            <p className="text-xs text-gray-500 mt-2 text-center">
+            {/* <p className="text-xs text-slate-500 dark:text-gray-500 mt-2 text-center">
               Press Enter to send, Shift+Enter for new line • Drag & drop images or click the upload icon
-            </p>
+            </p> */}
           </div>
         </div>
       </div>
