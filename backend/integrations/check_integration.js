@@ -1,25 +1,9 @@
 /*
- * check_integrations.js
+ * check_integration.js
  *
- * A standalone utility script to check the status of Blender addon integrations.
- *
- * This script will:
- * 1. Read your .env file for BLENDER_TCP_PORT and BLENDER_TCP_HOST.
- * 2. Connect to the Blender TCP server.
- * 3. Send commands:
- * - get_polyhaven_status
- * - get_hyper3d_status
- * - get_sketchfab_status
- * 4. Print the JSON response for each command.
- * 5. Disconnect and exit.
- *
- * To run:
- * 1. Make sure Blender is running with the addon enabled and connected.
- * 2. Run from your terminal: `node check_integrations.js`
- *
- * Dependencies:
- * - "dotenv": "npm install dotenv"
- * (Uses built-in 'net' module)
+ * "Dumb" module for checking integration status.
+ * Exports a function that receives 'sendCommand' from the main integration index.
+ * Retains its standalone functionality for debugging.
  */
 
 import net from 'net';
@@ -27,99 +11,110 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+/**
+ * Checks the status of all three integrations by calling their
+ * respective status commands sequentially.
+ * @param {Function} sendCommand - The 'sendCommand' function from the core module.
+ * @param {boolean} verbose - Whether to print status messages to console.
+ * @returns {Promise<object>} - Resolves with all integration statuses.
+ */
+export async function checkAllIntegrations(sendCommand, verbose = true) {
+  try {
+    if (verbose) console.log('--- 🛡️  Checking Blender Integrations ---');
+
+    let polyhaven = false, hyper3d = false, sketchfab = false;
+    let polyStatus, hyperStatus, sketchStatus;
+
+    // Check PolyHaven
+    try {
+      polyStatus = await sendCommand('get_polyhaven_status', {});
+      polyhaven = polyStatus?.enabled === true;
+      if (verbose) console.log('✅ PolyHaven Status:', polyStatus);
+    } catch (e) {
+      if (verbose) console.error('❌ PolyHaven Check Failed:', e.message);
+    }
+
+    // Check Hyper3D
+    try {
+      hyperStatus = await sendCommand('get_hyper3d_status', {});
+      hyper3d = hyperStatus?.enabled === true;
+      if (verbose) console.log('✅ Hyper3D Status:', hyperStatus);
+    } catch (e) {
+      if (verbose) console.error('❌ Hyper3D Check Failed:', e.message);
+    }
+    
+    // Check Sketchfab
+    try {
+      sketchStatus = await sendCommand('get_sketchfab_status', {});
+      sketchfab = sketchStatus?.enabled === true;
+      if (verbose) console.log('✅ Sketchfab Status:', sketchStatus);
+    } catch (e) {
+      if (verbose) console.error('❌ Sketchfab Check Failed:', e.message);
+    }
+
+    if (verbose) console.log('\n--- All checks complete ---');
+
+    // Return combined status object
+    return {
+      polyhaven,
+      hyper3d,
+      sketchfab,
+      detail: {
+        polyhaven: polyStatus || { enabled: false, message: "Check failed" },
+        hyper3d: hyperStatus || { enabled: false, message: "Check failed" },
+        sketchfab: sketchStatus || { enabled: false, message: "Check failed" }
+      }
+    };
+  } catch (err) {
+    if (verbose) console.error('\n❌ Check Run Failed:', err.message);
+    throw err;
+  }
+}
+
+
+// --- STANDALONE SCRIPT LOGIC ---
+// The following code only runs if this file is executed directly
+// (e.g., `node integrations/check_integration.js`)
+// It is a copy of the connection logic needed *only* for standalone debugging.
+
 const PORT = parseInt(process.env.BLENDER_TCP_PORT || "9876", 10);
 const HOST = process.env.BLENDER_TCP_HOST || "127.0.0.1";
 
-const client = new net.Socket();
+let client = null;
 let buffer = '';
-let pendingRequest = null; // { resolve, reject, timeout }
+let pendingRequest = null;
+let blenderConnected = false;
 
-/**
- * Simplified JSON message parser.
- * This re-uses the brace-counting logic from server.js to find a
- * complete JSON object in the TCP stream.
- */
 function parseBuffer() {
     if (!pendingRequest) {
-        // If we aren't waiting for a response, don't bother parsing.
-        // This can happen if a late/stray message arrives.
-        // For this simple script, we'll just clear the buffer.
-        if (buffer.length > 1000) { // Safety clear
-            buffer = "";
-        }
+        if (buffer.length > 2048) buffer = "";
         return;
     }
-    
     try {
-        let braceCount = 0;
-        let jsonStart = -1;
-        let jsonEnd = -1;
-        let inString = false;
-        let escapeNext = false;
-
+        let braceCount = 0, jsonStart = -1, jsonEnd = -1, inString = false, escapeNext = false;
         for (let i = 0; i < buffer.length; i++) {
             const char = buffer[i];
-
-            if (escapeNext) {
-                escapeNext = false;
-                continue;
-            }
-            if (char === "\\") {
-                escapeNext = true;
-                continue;
-            }
-            if (char === '"') {
-                inString = !inString;
-                continue;
-            }
-
-            if (!inString) {
-                if (char === "{") {
-                    if (jsonStart === -1) jsonStart = i;
-                    braceCount++;
-                } else if (char === "}") {
-                    braceCount--;
-                    if (braceCount === 0 && jsonStart !== -1) {
-                        jsonEnd = i + 1;
-                        break;
-                    }
-                }
-            }
+            if (escapeNext) { escapeNext = false; continue; }
+            if (char === "\\") { escapeNext = true; continue; }
+            if (char === '"') { inString = !inString; continue; }
+            if (inString) continue;
+            if (char === "{") { if (jsonStart === -1) jsonStart = i; braceCount++; }
+            else if (char === "}") { braceCount--; if (braceCount === 0 && jsonStart !== -1) { jsonEnd = i + 1; break; } }
         }
-
-        if (jsonEnd === -1) {
-            // Not a full message yet, wait for more data
-            return;
-        }
-
+        if (jsonEnd === -1) return;
         const jsonStr = buffer.slice(jsonStart, jsonEnd);
         const parsed = JSON.parse(jsonStr);
-        
-        // Message is processed, clear it from the buffer
         buffer = buffer.slice(jsonEnd).trim();
-
         if (pendingRequest) {
             clearTimeout(pendingRequest.timeout);
-            if (parsed.status === 'error') {
-                pendingRequest.reject(new Error(parsed.message || 'Unknown Blender error'));
-            } else {
-                pendingRequest.resolve(parsed.result || parsed);
-            }
+            if (parsed.status === 'error') pendingRequest.reject(new Error(parsed.message || 'Unknown Blender error'));
+            else pendingRequest.resolve(parsed.result || parsed);
             pendingRequest = null;
         }
-        
-        // Check if there's another full message in the buffer
-        if (buffer.length > 0) {
-            parseBuffer();
-        }
-
+        if (buffer.length > 0) process.nextTick(parseBuffer);
     } catch (err) {
-        if (err instanceof SyntaxError) {
-            // Incomplete JSON, just wait for more data
-            return;
-        }
         console.error("❌ Parse Error:", err.message);
-        buffer = ""; // Clear a bad buffer
+        buffer = "";
         if (pendingRequest) {
             pendingRequest.reject(err);
             pendingRequest = null;
@@ -127,79 +122,58 @@ function parseBuffer() {
     }
 }
 
-client.on('data', (chunk) => {
-    buffer += chunk.toString('utf8');
-    parseBuffer();
-});
-
-client.on('error', (err) => {
-    console.error('❌ Connection Error:', err.message);
-    if (err.code === 'ECONNREFUSED') {
-        console.error('💡 Is Blender running? Is the addon enabled and connected?');
-    }
-    if (pendingRequest) {
-        pendingRequest.reject(err);
-    }
-    process.exit(1);
-});
-
-client.on('close', () => {
-    console.log('🔌 Connection closed.');
-});
-
-/**
- * Sends a single command and waits for a single response.
- * @param {string} commandType - The 'type' of command for the addon
- * @param {object} params - The 'params' object for the command
- * @returns {Promise<object>} - Resolves with the 'result' from Blender
- */
-function sendCommand(commandType, params = {}) {
+function sendCommandStandalone(commandType, params = {}) {
     return new Promise((resolve, reject) => {
-        if (pendingRequest) {
-            return reject(new Error('Another request is already pending.'));
-        }
-
+        if (pendingRequest) return reject(new Error('Another request is already pending.'));
+        const timeoutMs = 30000; // 30s timeout for status checks
         const timeout = setTimeout(() => {
             pendingRequest = null;
-            reject(new Error(`Timeout: No response for ${commandType} after 5 seconds.`));
-        }, 5000);
-
+            reject(new Error(`Timeout: No response for ${commandType} after ${timeoutMs / 1000}s.`));
+        }, timeoutMs);
         pendingRequest = { resolve, reject, timeout };
-
         const json = JSON.stringify({ type: commandType, params });
         console.log(`\n📤 Sending: ${json}`);
         client.write(json);
     });
 }
 
-/**
- * Main function to run all checks in sequence.
- */
-async function runChecks() {
+function connectToBlender() {
+  return new Promise((resolve, reject) => {
+    console.log(`Connecting to Blender at ${HOST}:${PORT}...`);
+    client = new net.Socket();
+    client.connect(PORT, HOST, () => {
+      blenderConnected = true;
+      console.log("✅ Blender connected.");
+      resolve();
+    });
+    client.on('data', parseBuffer);
+    client.on('error', (err) => {
+      if (!blenderConnected) reject(err);
+      else console.error('❌ Connection Error:', err.message);
+    });
+    client.on('close', () => {
+      console.log('🔌 Connection closed.');
+      blenderConnected = false;
+    });
+  });
+}
+
+async function runChecksStandalone() {
     try {
-        console.log('--- 🛡️  Checking Blender Integrations ---');
-
-        const polyStatus = await sendCommand('get_polyhaven_status');
-        console.log('✅ PolyHaven Status:', polyStatus);
-
-        const hyperStatus = await sendCommand('get_hyper3d_status');
-        console.log('✅ Hyper3D Status:', hyperStatus);
-
-        const sketchfabStatus = await sendCommand('get_sketchfab_status');
-        console.log('✅ Sketchfab Status:', sketchfabStatus);
-
-        console.log('\n--- All checks complete ---');
-
+        await connectToBlender();
+        await checkAllIntegrations(sendCommandStandalone, true);
     } catch (err) {
-        console.error('\n❌ Check Failed:', err.message);
+        console.error(`\n❌ Fatal Error: ${err.message}`);
+        if (err.code === 'ECONNREFUSED') {
+            console.error('💡 Is Blender running? Is the addon enabled and "Connected to MCP server"?');
+        }
     } finally {
-        client.end(); // Close the connection
+        if (client) client.end();
         process.exit(0);
     }
 }
 
-// --- Start the script ---
-client.connect(PORT, HOST, () => {
-    console.log(`🚀 Connected to Blender on ${HOST}:${PORT}`);
-    runChecks();
-});
+// Check if the script is being run directly
+if (import.meta.url.endsWith(process.argv[1].replace(/\\/g, '/'))) {
+    runChecksStandalone();
+}

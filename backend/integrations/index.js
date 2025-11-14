@@ -1,0 +1,353 @@
+/*
+ * Integrations module - Central entry point for all Blender integrations
+ *
+ * This file is the "smart core" of the integration system.
+ * 1. It creates and manages the SINGLE TCP connection to Blender.
+ * 2. It handles the sendCommand queue.
+ * 3. It imports logic from the "dumb" module files (hyper3d, sketchfab, polyhaven).
+ * 4. It passes its own 'sendCommand' function to those modules.
+ */
+
+import net from 'net';
+import * as hyper3d from './hyper3d.js';
+import * as sketchfab from './sketchfab.js';
+import * as polyhaven from './polyhaven.js';
+
+// Default TCP connection settings
+const PORT = parseInt(process.env.BLENDER_TCP_PORT || "9876", 10);
+const HOST = process.env.BLENDER_TCP_HOST || "127.0.0.1";
+
+// Connection tracking
+let client = null;
+let buffer = '';
+let isConnected = false;
+
+// Queue for managing multiple TCP commands
+let commandQueue = [];
+let isProcessingQueue = false;
+let pendingRequest = null; 
+
+/**
+ * Initialize the TCP connection to Blender
+ * @returns {Promise<void>}
+ */
+export function initBlenderConnection() {
+  return new Promise((resolve, reject) => {
+    if (client && isConnected) {
+        console.log("Blender connection already active.");
+        return resolve();
+    }
+    
+    try {
+      client = new net.Socket();
+      
+      // Setup event handlers
+      client.on('data', handleData);
+      client.on('error', handleError);
+      client.on('close', handleClose);
+      client.on('connect', () => {
+        isConnected = true;
+        console.log(`🚀 Connected to Blender TCP server on ${HOST}:${PORT}`);
+        resolve();
+      });
+      
+      // Initiate connection
+      client.connect(PORT, HOST, () => {
+        // Connection listener above will handle resolve
+      });
+
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+// Connection handler functions
+function handleData(chunk) {
+  buffer += chunk.toString('utf8');
+  parseBuffer();
+}
+
+function handleError(err) {
+  console.error('❌ Blender Connection Error:', err.message);
+  isConnected = false;
+  if (pendingRequest) {
+    try { pendingRequest.reject(err); } catch(e) {}
+    pendingRequest = null;
+  }
+  // Reject all pending commands in the queue
+  commandQueue.forEach(cmd => cmd.reject(new Error("Blender Connection Error")));
+  commandQueue = [];
+  isProcessingQueue = false;
+}
+
+function handleClose() {
+  console.log('🔌 Blender Connection closed.');
+  isConnected = false;
+  handleError(new Error("Connection closed"));
+}
+
+/**
+ * Simplified JSON message parser
+ */
+function parseBuffer() {
+  if (!pendingRequest) {
+    if (buffer.length > 2048) buffer = ""; // Safety clear
+    return;
+  }
+  
+  try {
+    let braceCount = 0;
+    let jsonStart = -1, jsonEnd = -1, inString = false, escapeNext = false;
+
+    for (let i = 0; i < buffer.length; i++) {
+      const char = buffer[i];
+      if (escapeNext) { escapeNext = false; continue; }
+      if (char === "\\") { escapeNext = true; continue; }
+      if (char === '"') { inString = !inString; continue; }
+      if (inString) continue;
+
+      if (char === "{") {
+        if (jsonStart === -1) jsonStart = i;
+        braceCount++;
+      } else if (char === "}") {
+        braceCount--;
+        if (braceCount === 0 && jsonStart !== -1) {
+          jsonEnd = i + 1;
+          break;
+        }
+      }
+    }
+
+    if (jsonEnd === -1) return; // Not a full message yet
+
+    const jsonStr = buffer.slice(jsonStart, jsonEnd);
+    const parsed = JSON.parse(jsonStr);
+    buffer = buffer.slice(jsonEnd).trim();
+
+    if (pendingRequest) {
+      clearTimeout(pendingRequest.timeout);
+      if (parsed.status === 'error') {
+        pendingRequest.reject(new Error(parsed.message || 'Unknown Blender error'));
+      } else {
+        pendingRequest.resolve(parsed.result || parsed);
+      }
+      pendingRequest = null;
+    }
+    
+    if (buffer.length > 0) process.nextTick(parseBuffer);
+    process.nextTick(processCommandQueue); // Try to process next command
+
+  } catch (err) {
+    console.error("❌ Parse Error:", err.message, "Buffer:", buffer);
+    buffer = ""; // Clear a bad buffer
+    if (pendingRequest) {
+      pendingRequest.reject(err);
+      pendingRequest = null;
+    }
+    process.nextTick(processCommandQueue);
+  }
+}
+
+/**
+ * Send a command to the Blender TCP server with queue management
+ * @param {string} commandType - The command type 
+ * @param {object} params - The command parameters
+ * @returns {Promise<object>} - The command result
+ */
+export function sendCommand(commandType, params = {}) {
+  return new Promise((resolve, reject) => {
+    if (!client || !isConnected) {
+      // Try to reconnect if connection is lost
+      console.warn("Not connected. Attempting to reconnect...");
+      initBlenderConnection().then(() => {
+         enqueueCommand(commandType, params, resolve, reject);
+      }).catch(err => {
+         reject(new Error(`Not connected to Blender TCP server: ${err.message}`));
+      });
+    } else {
+       enqueueCommand(commandType, params, resolve, reject);
+    }
+  });
+}
+
+function enqueueCommand(commandType, params, resolve, reject) {
+    // Determine timeout based on command type
+    let timeoutMs = 15000; // Default 15s
+    if (commandType.startsWith('download_') || commandType.includes('download')) {
+      timeoutMs = 60000; // 60s for downloads
+    } else if (commandType.startsWith('create_rodin_job')) {
+      timeoutMs = 30000; // 30s for job creation
+    } else if (commandType.startsWith('search_')) {
+      timeoutMs = 30000; // 30s for searches
+    }
+
+    // Add command to queue
+    commandQueue.push({
+      commandType,
+      params,
+      resolve,
+      reject,
+      timeoutMs
+    });
+    
+    // Process queue if not already processing
+    if (!isProcessingQueue) {
+      process.nextTick(processCommandQueue);
+    }
+}
+
+/**
+ * Process the command queue one at a time
+ */
+async function processCommandQueue() {
+  if (isProcessingQueue || commandQueue.length === 0) {
+    return;
+  }
+  
+  // Check if a request is already pending a response
+  if (pendingRequest) {
+    return;
+  }
+  
+  isProcessingQueue = true;
+  const command = commandQueue.shift();
+  
+  try {
+    const timeout = setTimeout(() => {
+      pendingRequest = null;
+      command.reject(new Error(`Timeout: No response for ${command.commandType} after ${command.timeoutMs / 1000}s.`));
+      isProcessingQueue = false;
+      process.nextTick(processCommandQueue); // Continue processing queue
+    }, command.timeoutMs);
+
+    pendingRequest = { 
+      resolve: (result) => {
+        command.resolve(result);
+        clearTimeout(timeout);
+        pendingRequest = null;
+        isProcessingQueue = false;
+        process.nextTick(processCommandQueue); // Continue processing queue
+      },
+      reject: (error) => {
+        command.reject(error);
+        clearTimeout(timeout);
+        pendingRequest = null;
+        isProcessingQueue = false;
+        process.nextTick(processCommandQueue); // Continue processing queue
+      }, 
+      timeout 
+    };
+
+    console.log(`[TCP] Sending command: ${command.commandType}`);
+    const json = JSON.stringify({ type: command.commandType, params: command.params });
+    client.write(json);
+  } catch (err) {
+    command.reject(err);
+    pendingRequest = null;
+    isProcessingQueue = false;
+    process.nextTick(processCommandQueue); // Continue processing queue
+  }
+}
+
+/**
+ * Check if the connection to Blender is active
+ * @returns {boolean} - True if connected
+ */
+export function isBlenderConnected() {
+  return isConnected;
+}
+
+/**
+ * Close the connection to Blender
+ */
+export function closeConnection() {
+  if (client) {
+    client.end();
+    client = null;
+    isConnected = false;
+    commandQueue = [];
+    pendingRequest = null;
+  }
+}
+
+// Re-export key functions from integration modules
+export const integrationModules = {
+  // Make core TCP command sender available
+  sendCommand,
+  
+  // Integration status checking
+  checkIntegrationStatus: async () => {
+    try {
+      console.log('Checking integration status...');
+      
+      const polyStatus = await sendCommand('get_polyhaven_status', {});
+      const hyperStatus = await sendCommand('get_hyper3d_status', {});
+      const sketchStatus = await sendCommand('get_sketchfab_status', {});
+      
+      const result = { 
+        polyhaven: polyStatus?.enabled === true, 
+        hyper3d: hyperStatus?.enabled === true, 
+        sketchfab: sketchStatus?.enabled === true 
+      };
+      console.log('Final integration status:', result);
+      return result;
+    } catch (err) {
+      console.warn("Integration status check failed:", err?.message || err);
+      return { hyper3d: false, polyhaven: false, sketchfab: false };
+    }
+  },
+  
+  // Asset intent detection
+  detectAssetIntent: (promptText, integrationStatus) => {
+    const p = (promptText || "").toLowerCase().trim();
+    const hyper3dKeywords = ["realistic", "photorealistic", "hyper3d", "rodin", "dragon", "creature", "monster", "sculpture", "animal", "high detail"];
+    const sketchfabKeywords = ["sketchfab", "specific model", "brand name", "realistic car", "eames chair", "starship"];
+    const polyhavenKeywords = ["polyhaven", "texture", "hdri", "material", "generic", "simple chair", "basic furniture", "wooden chair", "table"];
+
+    if (integrationStatus?.hyper3d && hyper3dKeywords.some(k => p.includes(k))) 
+      return { type: "hyper3d", prompt: promptText };
+
+    if (integrationStatus?.sketchfab && sketchfabKeywords.some(k => p.includes(k))) {
+      const query = p.replace("sketchfab", "").replace("add", "").trim();
+      return { type: "sketchfab", query: query || "realistic model" };
+    }
+
+    if (integrationStatus?.polyhaven) {
+      if (p.includes("hdri") || p.includes("sky texture")) {
+        const query = p.replace("hdri", "").replace("sky texture", "").trim();
+        return { type: "polyhaven", asset_type: "hdris", query: query || "sky" };
+      }
+      if (p.includes("texture") || p.includes("material")) {
+        const query = p.replace("texture", "").replace("material", "").trim();
+        return { type: "polyhaven", asset_type: "textures", query: query || "wood" };
+      }
+      if (polyhavenKeywords.some(k => p.includes(k))) {
+        const query = p.replace("polyhaven", "").trim();
+        return { type: "polyhaven", asset_type: "models", query: query || p };
+      }
+    }
+    
+    return { type: "none" };
+  },
+  
+  // Integration-specific modules
+  // We call the imported functions and pass them our 'sendCommand'
+  hyper3d: {
+    generateAndImportAsset: (prompt, progress) => {
+      return hyper3d.generateAndImportAsset(sendCommand, prompt, progress);
+    }
+  },
+  
+  sketchfab: {
+    searchAndImportModel: (query) => {
+      return sketchfab.searchAndImportModel(sendCommand, query);
+    }
+  },
+  
+  polyhaven: {
+    searchAndImportAsset: (query, assetType = "models") => {
+      return polyhaven.searchAndImportAsset(sendCommand, query, assetType);
+    }
+  }
+};

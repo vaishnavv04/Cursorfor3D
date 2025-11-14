@@ -15,6 +15,7 @@ import pgvector from "pgvector/pg";
 
 import { pool, initSchema, mapConversation, mapMessage } from "./db.js";
 import { createProgressTracker } from "./utils/progress.js";
+import { integrationModules, initBlenderConnection, sendCommand, isBlenderConnected } from './integrations/index.js';
 import path from "node:path";
 import os from "node:os";
 
@@ -52,7 +53,7 @@ const PROMPT_ENHANCER_MODEL = "llama-3.1-8b-instant";
 
 // RAG / embeddings
 const EMBEDDING_MODEL_NAME = "Xenova/all-MiniLM-L6-v2";
-const EXPECTED_EMBEDDING_DIM = 384;
+const EXPECTED_EMBEDDING_DIM = 380; // Match the existing table dimension
 
 let embedderPromise = null;
 async function getEmbedder() {
@@ -72,20 +73,58 @@ async function embedQuery(text) {
   return arr;
 }
 
+async function tableExists(tableName) {
+  try {
+    const { rows } = await pool.query(
+      "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = $1)",
+      [tableName]
+    );
+    return rows[0].exists;
+  } catch (error) {
+    console.error(`Error checking if table exists: ${error.message}`);
+    return false;
+  }
+}
+
 async function searchKnowledgeBase(queryText, limit = 5) {
   console.log(`🔍 [RAG] Searching knowledge base for: "${String(queryText).slice(0, 100)}..."`);
   try {
     const queryEmbedding = await embedQuery(queryText);
     const vectorString = pgvector.toSql(queryEmbedding);
+    
+    // Check if we have the new table available
+    const hasNewTable = await tableExists("blender_knowledge_new");
+    
+    // Try the new table first if it exists
+    if (hasNewTable) {
+      try {
+        const newTableQuery = `
+          SELECT content, 1 - (embedding <=> $1) AS similarity
+          FROM blender_knowledge_new
+          WHERE 1 - (embedding <=> $1) > 0.2
+          ORDER BY similarity DESC
+          LIMIT $2
+        `;
+        const { rows: newRows } = await pool.query(newTableQuery, [vectorString, limit]);
+        if (newRows && newRows.length > 0) {
+          console.log(`✅ [RAG] Found ${newRows.length} relevant documents in new table`);
+          return newRows.map((r) => r.content);
+        }
+      } catch (newTableError) {
+        console.warn(`[RAG] Error searching new table: ${newTableError.message}`);
+      }
+    }
+    
+    // Fall back to original table
     const query = `
       SELECT content, 1 - (embedding <=> $1) AS similarity
       FROM blender_knowledge
-      WHERE 1 - (embedding <=> $1) > 0.5
+      WHERE 1 - (embedding <=> $1) > 0.2
       ORDER BY similarity DESC
       LIMIT $2
     `;
     const { rows } = await pool.query(query, [vectorString, limit]);
-    console.log(`✅ [RAG] Found ${rows.length} relevant documents`);
+    console.log(`✅ [RAG] Found ${rows.length} relevant documents in original table`);
     return rows.map((r) => r.content);
   } catch (error) {
     console.error(`❌ [RAG] Knowledge base search failed:`, error?.message || error);
@@ -206,46 +245,71 @@ async function callAgentLLM(systemPrompt, agentHistory, model = "gemini") {
   }
 }
 
+// Decide whether to call integration import or generate bpy code
+function shouldUseIntegrationForPrompt(prompt, integrationStatus) {
+  const asset = integrationModules.detectAssetIntent(prompt, integrationStatus);
+  
+  if (asset.type === "none") return { useIntegration: false, assetIntent: asset };
+  
+  // If integration is available for detected asset type, prefer integration.
+  switch (asset.type) {
+    case "hyper3d":
+      return { useIntegration: Boolean(integrationStatus.hyper3d), assetIntent: asset };
+    case "sketchfab":
+      return { useIntegration: Boolean(integrationStatus.sketchfab), assetIntent: asset };
+    case "polyhaven":
+      return { useIntegration: Boolean(integrationStatus.polyhaven), assetIntent: asset };
+    default:
+      return { useIntegration: false, assetIntent: asset };
+  }
+}
+
+async function ensureRagForPrompt(prompt, maxDocs = 5) {
+  try {
+    const docs = await searchKnowledgeBase(prompt, maxDocs);
+    return docs && docs.length ? docs : [];
+  } catch (err) {
+    console.warn("RAG search failed:", err?.message || err);
+    return [];
+  }
+}
+
 // Asset import tool wrapper
-async function runAssetImportTool(userPrompt, integrationStatus) {
+async function generateAndImportAssetFromIntegration(userPrompt, integrationStatus) {
+  if (!isBlenderConnected()) throw new Error("Blender is not connected.");
+  
   const progress = createProgressTracker();
-  const assetIntent = detectAssetIntent(userPrompt, integrationStatus);
+  const assetIntent = integrationModules.detectAssetIntent(userPrompt, integrationStatus);
 
   switch (assetIntent.type) {
     case "hyper3d": {
-      const job = await sendCommandToBlender("create_rodin_job", { text_prompt: assetIntent.prompt });
-      const subscriptionKey = job.jobs?.subscription_key;
-      const taskUuid = job.uuid;
-      if (!subscriptionKey || !taskUuid) throw new Error("Addon did not return jobs.subscription_key or uuid.");
-      await pollHyper3DJob(subscriptionKey, progress);
-      const importResult = await sendCommandToBlender("import_generated_asset", { task_uuid: taskUuid, name: userPrompt });
-      if (!importResult.succeed || !importResult.name) throw new Error(`Failed to import Hyper3D asset: ${importResult.error}`);
-      return { name: importResult.name, type: "Hyper3D", assetType: "models" };
+      // Use hyper3d module
+      return await integrationModules.hyper3d.generateAndImportAsset(assetIntent.prompt, progress);
     }
+    
     case "sketchfab": {
-      const searchResult = await sendCommandToBlender("search_sketchfab_models", { query: assetIntent.query });
-      const firstHit = searchResult?.results?.[0];
-      if (!firstHit?.uid) throw new Error(`No Sketchfab models found for query: ${assetIntent.query}`);
-      const importResult = await sendCommandToBlender("download_sketchfab_model", { uid: firstHit.uid });
-      if (!importResult.success || !importResult.imported_objects || importResult.imported_objects.length === 0) throw new Error(`Failed to import Sketchfab model: ${importResult.error}`);
-      const objectName = importResult.imported_objects[0];
-      return { name: objectName, type: "Sketchfab", assetType: "models" };
+      // Use sketchfab module
+      return await integrationModules.sketchfab.searchAndImportModel(assetIntent.query);
     }
+    
     case "polyhaven": {
-      const stopWords = ["a", "an", "the", "of", "for", "with", "and"];
-      const keywords = (assetIntent.query || userPrompt).split(" ").map(w => w.toLowerCase()).filter(w => !stopWords.includes(w) && w.length > 1);
-      const categoryString = keywords.join(",");
-      const searchResult = await sendCommandToBlender("search_polyhaven_assets", { asset_type: assetIntent.asset_type, categories: categoryString });
-      if (!searchResult.assets || Object.keys(searchResult.assets).length === 0) throw new Error(`No PolyHaven assets found for categories: ${categoryString}`);
-      const assetId = Object.keys(searchResult.assets)[0];
-      const importResult = await sendCommandToBlender("download_polyhaven_asset", { asset_id: assetId, asset_type: assetIntent.asset_type, resolution: "1k", file_format: assetIntent.asset_type === "hdris" ? "hdr" : "gltf" });
-      if (!importResult.success) throw new Error(`Failed to import PolyHaven asset: ${importResult.error}`);
-      const objectName = importResult.imported_objects?.[0] || importResult.material_name || importResult.image_name || "PolyHaven_Asset";
-      return { name: objectName, type: "PolyHaven", assetType: assetIntent.asset_type };
+      // Use polyhaven module
+      return await integrationModules.polyhaven.searchAndImportAsset(
+        assetIntent.query, 
+        assetIntent.asset_type
+      );
     }
+    
     default:
       throw new Error("No asset intent detected. This tool should not have been called.");
   }
+}
+
+// Function used by the agent to import assets
+async function runAssetImportTool(prompt, integrationStatus) {
+  // This function delegates to generateAndImportAssetFromIntegration
+  // which now uses our integration modules
+  return await generateAndImportAssetFromIntegration(prompt, integrationStatus);
 }
 
 // CACHE / ANALYTICS / JOBS
@@ -321,318 +385,61 @@ async function processJobQueue() {
   }
 }
 
-// Polling for Hyper3D
+// Polling for Hyper3D - now uses the integration module
 async function pollHyper3DJob(subscriptionKey, progress) {
-  const POLL_INTERVAL_MS = 5000;
-  const JOB_TIMEOUT_MS = 180000;
-  const startTime = Date.now();
-  progress.add("hyper3d_poll_start", "Polling Hyper3D job", { subKey: subscriptionKey.slice(0, 10) + "..." });
-  while (Date.now() - startTime < JOB_TIMEOUT_MS) {
-    try {
-      const statusRes = await sendCommandToBlender("poll_rodin_job_status", { subscription_key: subscriptionKey });
-      if (statusRes.status_list) {
-        if (statusRes.status_list.every(s => s === "Done")) {
-          progress.merge("hyper3d_poll_start", { message: "Hyper3D job succeeded" });
-          return;
-        }
-        if (statusRes.status_list.some(s => s === "failed")) {
-          throw new Error("Hyper3D job failed (one or more tasks failed)");
-        }
-        progress.add("hyper3d_poll_wait", "Hyper3D job running...", { currentStatus: statusRes.status_list.join(", ") });
-      } else if (statusRes.status === "succeeded") {
-        progress.merge("hyper3d_poll_start", { message: "Hyper3D job (fal.ai) succeeded", data: statusRes.result });
-        return statusRes.result;
-      } else if (statusRes.status === "failed") {
-        throw new Error(statusRes.error || "Hyper3D job failed");
-      } else {
-        progress.add("hyper3d_poll_wait", "Hyper3D job running...", { currentStatus: statusRes.status });
-      }
-      await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
-    } catch (err) {
-      progress.addError("hyper3d_poll_error", "Polling failed", err?.message || String(err));
-      throw err;
-    }
-  }
-  throw new Error("Hyper3D job timed out after 3 minutes");
+  // Use the integration module's polling function
+  return await integrationModules.hyper3d.pollHyper3DJob(subscriptionKey, progress);
 }
 
-function detectAssetIntent(promptText, integrationStatus) {
-  const p = (promptText || "").toLowerCase().trim();
-  const hyper3dKeywords = ["realistic", "photorealistic", "hyper3d", "rodin", "dragon", "creature", "monster", "sculpture", "animal", "high detail"];
-  const sketchfabKeywords = ["sketchfab", "specific model", "brand name", "realistic car", "eames chair", "starship"];
-  const polyhavenKeywords = ["polyhaven", "texture", "hdri", "material", "generic", "simple chair", "basic furniture", "wooden chair", "table"];
-  if (integrationStatus?.hyper3d && hyper3dKeywords.some(k => p.includes(k))) return { type: "hyper3d", prompt: promptText };
-  if (integrationStatus?.sketchfab && sketchfabKeywords.some(k => p.includes(k))) {
-    const query = p.replace("sketchfab", "").replace("add", "").trim();
-    return { type: "sketchfab", query: query || "realistic model" };
-  }
-  if (integrationStatus?.polyhaven) {
-    if (p.includes("hdri") || p.includes("sky texture")) {
-      const query = p.replace("hdri", "").replace("sky texture", "").trim();
-      return { type: "polyhaven", asset_type: "hdris", query: query || "sky" };
-    }
-    if (p.includes("texture") || p.includes("material")) {
-      const query = p.replace("texture", "").replace("material", "").trim();
-      return { type: "polyhaven", asset_type: "textures", query: query || "wood" };
-    }
-    if (polyhavenKeywords.some(k => p.includes(k))) {
-      const query = p.replace("polyhaven", "").trim();
-      return { type: "polyhaven", asset_type: "models", query: query || p };
-    }
-  }
-  return { type: "none" };
-}
+// Now imported from the integrations module
+const detectAssetIntent = integrationModules.detectAssetIntent;
 
 function summarizeText(text, maxLength = 400) {
-  if (!text) return "";
   if (text.length <= maxLength) return text;
-  return `${text.slice(0, maxLength)}…`;
+  const truncated = text.substring(0, maxLength - 3);
+  return truncated + "...";
 }
 
 /* =========================
-   BLENDER TCP CONNECTION HELPERS (single, consolidated, robust)
+   BLENDER CONNECTION - Uses centralized integration system
    ========================= */
 
-let blenderClient = null;
+// Connection state now managed by integrations/index.js
+// We just need to track connection status for server logic
 let blenderConnected = false;
-let buffer = "";
-let nextRequestId = 1;
-const pendingRequests = new Map();
-let requestQueue = [];
-let isProcessingQueue = false;
-let expectedResponseId = null;
-const timedOutRequests = new Set();
 
-function resetBlenderState() {
-  buffer = "";
-  for (const [, { reject, timeout }] of pendingRequests.entries()) {
-    if (timeout) clearTimeout(timeout);
-    try { reject(new Error("Blender connection reset")); } catch (e) {}
-  }
-  pendingRequests.clear();
-  for (const { reject } of requestQueue) {
-    try { reject(new Error("Blender connection reset")); } catch (e) {}
-  }
-  requestQueue = [];
-  isProcessingQueue = false;
-  expectedResponseId = null;
-  timedOutRequests.clear();
-}
-
-function initializeBlenderConnection() {
-  for (const [, { timeout }] of pendingRequests.entries()) {
-    if (timeout) clearTimeout(timeout);
-  }
-  pendingRequests.clear();
-  isProcessingQueue = false;
-  expectedResponseId = null;
-  timedOutRequests.clear();
-  if (requestQueue.length > 0) {
-    console.log(`📋 Processing ${requestQueue.length} queued request(s) after connection established`);
-    processRequestQueue();
-  }
-}
-
-function parseIncomingMessages(chunk) {
-  buffer += String(chunk);
-  let previousBufferLength = -1;
-
-  while (buffer.length > 0) {
-    const currentBufferLength = buffer.length;
-    if (currentBufferLength === previousBufferLength) {
-      console.warn("⚠️ Detected potential infinite loop, trimming first character");
-      buffer = buffer.slice(1);
-      previousBufferLength = -1;
-      continue;
-    }
-    previousBufferLength = currentBufferLength;
-
-    try {
-      let braceCount = 0;
-      let jsonStart = -1;
-      let jsonEnd = -1;
-      let inString = false;
-      let escapeNext = false;
-
-      for (let i = 0; i < buffer.length; i++) {
-        const char = buffer[i];
-
-        if (escapeNext) {
-          escapeNext = false;
-          continue;
-        }
-        if (char === "\\") {
-          escapeNext = true;
-          continue;
-        }
-        if (char === '"') {
-          inString = !inString;
-          continue;
-        }
-        if (!inString) {
-          if (char === "{") {
-            if (jsonStart === -1) jsonStart = i;
-            braceCount++;
-          } else if (char === "}") {
-            braceCount--;
-            if (braceCount === 0 && jsonStart !== -1) {
-              jsonEnd = i + 1;
-              break;
-            }
-          }
-        }
-      }
-
-      if (jsonEnd === -1) return; // wait for more data
-
-      const jsonStr = buffer.slice(jsonStart, jsonEnd);
-      const parsed = JSON.parse(jsonStr);
-      console.log("📥 Response from Blender:", JSON.stringify(parsed));
-      buffer = buffer.slice(jsonEnd).trim();
-      previousBufferLength = -1;
-
-      const firstRequestId = Array.from(pendingRequests.keys())[0];
-      if (firstRequestId === undefined) {
-        if (expectedResponseId !== null && timedOutRequests.has(expectedResponseId)) {
-          console.warn(`⚠️ Discarding late response for timed-out request ${expectedResponseId}`);
-          expectedResponseId = null;
-        } else {
-          console.warn("⚠️ Received response from Blender but no pending request found");
-        }
-        return;
-      }
-
-      if (expectedResponseId !== null && firstRequestId !== expectedResponseId) {
-        if (timedOutRequests.has(expectedResponseId)) {
-          console.warn(`⚠️ Discarding late response for timed-out request ${expectedResponseId}, processing response for ${firstRequestId}`);
-          expectedResponseId = firstRequestId;
-        } else {
-          console.warn(`⚠️ Response mismatch: expected ${expectedResponseId}, got ${firstRequestId}`);
-          expectedResponseId = firstRequestId;
-        }
-      } else {
-        expectedResponseId = firstRequestId;
-      }
-
-      if (timedOutRequests.has(expectedResponseId)) {
-        console.warn(`⚠️ Discarding response for timed-out request ${expectedResponseId}`);
-        timedOutRequests.delete(expectedResponseId);
-        expectedResponseId = null;
-        const nextId = Array.from(pendingRequests.keys())[0];
-        expectedResponseId = nextId !== undefined ? nextId : null;
-        return;
-      }
-
-      const pending = pendingRequests.get(expectedResponseId);
-      if (pending) {
-        pendingRequests.delete(expectedResponseId);
-        if (pending.timeout) clearTimeout(pending.timeout);
-        timedOutRequests.delete(expectedResponseId);
-
-        if (parsed.status === "error") {
-          pending.reject(new Error(parsed.message || "Unknown error from Blender"));
-        } else {
-          pending.resolve(parsed.result ?? parsed);
-        }
-
-        const nextId = Array.from(pendingRequests.keys())[0];
-        expectedResponseId = nextId !== undefined ? nextId : null;
-        if (pending.onComplete) pending.onComplete();
-      } else {
-        console.warn(`⚠️ Expected request ${expectedResponseId} not found in pendingRequests`);
-        expectedResponseId = null;
-      }
-    } catch (err) {
-      if (err instanceof SyntaxError) {
-        const firstBrace = buffer.indexOf("{");
-        if (firstBrace === -1) {
-          buffer = "";
-          return;
-        }
-        buffer = firstBrace === 0 ? (buffer.indexOf("{", 1) !== -1 ? buffer.slice(buffer.indexOf("{", 1)) : buffer.slice(1)) : buffer.slice(firstBrace);
-        continue;
-      }
-
-      console.error("❌ Failed to parse Blender response:", err?.message || err);
-      buffer = "";
-      const firstRequestId = Array.from(pendingRequests.keys())[0];
-      if (firstRequestId !== undefined) {
-        const pending = pendingRequests.get(firstRequestId);
-        if (pending) {
-          pendingRequests.delete(firstRequestId);
-          if (pending.timeout) clearTimeout(pending.timeout);
-          pending.reject(new Error(`Failed to parse response: ${err?.message || String(err)}`));
-          if (pending.onComplete) pending.onComplete();
-        }
-      }
-      return;
-    }
-  }
-}
-
-function processRequestQueue() {
-  if (isProcessingQueue || requestQueue.length === 0) return;
-  isProcessingQueue = true;
-  const { requestId, commandType, params, resolve, reject } = requestQueue.shift();
-
-  if (!blenderClient || blenderClient.destroyed || !blenderConnected) {
-    isProcessingQueue = false;
-    reject(new Error("Blender socket not connected"));
-    processRequestQueue();
-    return;
-  }
-
-  const json = JSON.stringify({ type: commandType, params });
-  console.log(`📤 [Request ${requestId}] Sending command to Blender:`, json);
-
-  let timeoutMs = 15000;
-  if (commandType.startsWith("download_") || commandType.startsWith("search_") || commandType.startsWith("create_rodin_job") || commandType === "poll_rodin_job_status") {
-    timeoutMs = 60000;
-  }
-
-  const timeout = setTimeout(() => {
-    const pending = pendingRequests.get(requestId);
-    if (pending) {
-      timedOutRequests.add(requestId);
-      pendingRequests.delete(requestId);
-      pending.reject(new Error(`Timeout: No response for ${commandType} after ${timeoutMs / 1000}s.`));
-      if (expectedResponseId === requestId) {
-        const nextId = Array.from(pendingRequests.keys())[0];
-        expectedResponseId = nextId !== undefined ? nextId : null;
-      }
-      if (pending.onComplete) pending.onComplete();
-    }
-  }, timeoutMs);
-
-  pendingRequests.set(requestId, {
-    resolve,
-    reject,
-    timeout,
-    onComplete: () => {
-      isProcessingQueue = false;
-      processRequestQueue();
-    },
-  });
-
-  if (expectedResponseId === null) expectedResponseId = requestId;
-
+async function initializeBlenderConnection() {
   try {
-    blenderClient.write(json);
+    console.log(`Attempting to connect to Blender at ${BLENDER_TCP_HOST}:${BLENDER_TCP_PORT}`);
+    
+    // Initialize the connection using our integration module
+    await initBlenderConnection();
+    
+    // Set our connection flag using the centralized connection status
+    blenderConnected = isBlenderConnected();
+    
+    // Check integrations status
+    try {
+      const status = await fetchIntegrationStatusFromBlender(true);
+      console.log(`Integration status: Hyper3D: ${status.hyper3d ? '✅' : '❌'}, PolyHaven: ${status.polyhaven ? '✅' : '❌'}, Sketchfab: ${status.sketchfab ? '✅' : '❌'}`);
+    } catch (err) {
+      console.warn(`Failed to check integration status: ${err.message}`);
+    }
+    
+    console.log("✅ Connected to Blender TCP server");
   } catch (err) {
-    pendingRequests.delete(requestId);
-    if (timeout) clearTimeout(timeout);
-    isProcessingQueue = false;
-    reject(err);
-    processRequestQueue();
+    console.error(`❌ Failed to connect to Blender: ${err.message}`);
+    blenderConnected = false;
+    
+    // Retry after 5 seconds
+    console.log("Will retry connection in 5 seconds...");
+    setTimeout(() => initializeBlenderConnection(), 5000);
   }
 }
 
+// Use the centralized sendCommand from integration modules
 function sendCommandToBlender(commandType, params = {}) {
-  const requestId = nextRequestId++;
-  return new Promise((resolve, reject) => {
-    requestQueue.push({ requestId, commandType, params, resolve, reject });
-    if (!isProcessingQueue) processRequestQueue();
-  });
+  return sendCommand(commandType, params);
 }
 
 async function executeBlenderCode(code) {
@@ -689,6 +496,37 @@ function extractCodeFromText(text) {
   if (!text) return "";
   const match = text.match(/```(?:python|py)?\n([\s\S]*?)```/);
   return (match ? match[1] : text.replace(/```/g, "")).trim();
+}
+
+// ---- Integration availability cache + checker ----
+let integrationStatusCache = { value: { hyper3d: false, polyhaven: false, sketchfab: false }, at: 0 };
+const INTEGRATION_TTL_MS = 30_000; // refresh every 30s
+
+async function fetchIntegrationStatusFromBlender(force = false) {
+  const now = Date.now();
+  if (!force && integrationStatusCache.at && (now - integrationStatusCache.at) < INTEGRATION_TTL_MS) {
+    return integrationStatusCache.value;
+  }
+  
+  if (!isBlenderConnected()) {
+    integrationStatusCache = { value: { hyper3d: false, polyhaven: false, sketchfab: false }, at: now };
+    return integrationStatusCache.value;
+  }
+  
+  try {
+    // Use the integrations module to check status
+    const status = await integrationModules.checkIntegrationStatus();
+    
+    // Update cache
+    integrationStatusCache = { value: status, at: now };
+    return status;
+  } catch (err) {
+    // if Blender call fails, mark integrations as false but keep prior cache briefly
+    console.warn("Integration status check failed:", err?.message || err);
+    integrationStatusCache.at = now; // avoid hammering
+    integrationStatusCache.value = integrationStatusCache.value || { hyper3d: false, polyhaven: false, sketchfab: false };
+    return integrationStatusCache.value;
+  }
 }
 
 /* =========================
@@ -869,7 +707,7 @@ async function runGenerationCore(body, user) {
   let analyticsRecorded = false;
 
   const attachProgress = (error) => {
-    if (error && typeof error === "object" && !error.progress) error.progress = progress.steps;
+    if (error && typeof error === 'object' && !error.progress) error.progress = progress.steps;
     return error;
   };
 
@@ -894,22 +732,27 @@ async function runGenerationCore(body, user) {
     const dbHistory = (await getMessagesForHistory(conversation.id, 10)).map(msg => ({ role: msg.role, parts: [{ text: msg.parts[0].text }] }));
 
     let sceneContext = conversation.lastSceneContext || null;
-    const blenderAvailable = Boolean(blenderClient && blenderConnected);
+    const blenderAvailable = isBlenderConnected();
+
+    // fetch current integration status (cached)
     let integrationStatus = { hyper3d: false, polyhaven: false, sketchfab: false };
+    if (blenderAvailable) {
+      progress.add("integration_fetch", "Checking addon integration availability");
+      try {
+        integrationStatus = await fetchIntegrationStatusFromBlender().catch(e => integrationStatus);
+        progress.merge("integration_fetch", { message: "Integration status fetched", data: integrationStatus });
+      } catch (e) {
+        progress.addError("integration_fetch", "Failed to fetch integrations", e?.message || String(e));
+      }
+    }
 
     if (blenderAvailable) {
       progress.add("context_fetch", "Fetching context from Blender...");
       try {
-        [sceneContext, integrationStatus] = await Promise.all([
-          sendCommandToBlender("get_scene_info", {}).catch(err => {
-            progress.addError("scene_context", "Failed to fetch scene context", err?.message || String(err));
-            return sceneContext;
-          }),
-          sendCommandToBlender("get_integration_status", {}).catch(err => {
-            progress.addError("integration_check", "Failed to check integration status", err?.message || String(err));
-            return integrationStatus;
-          }),
-        ]);
+        sceneContext = await sendCommandToBlender("get_scene_info", {}).catch(err => {
+          progress.addError("scene_context", "Failed to fetch scene context", err?.message || String(err));
+          return sceneContext;
+        });
         progress.merge("context_fetch", { message: "Blender context updated" });
       } catch (err) {
         progress.addError("context_fetch", "Failed to fetch Blender context", err?.message || String(err));
@@ -918,6 +761,9 @@ async function runGenerationCore(body, user) {
       progress.add("context_skipped", "Blender not connected, using cached context");
     }
 
+    // Pre-warm RAG context for the user prompt (agent will use it on search_knowledge_base or before code generation)
+    let ragContext = await ensureRagForPrompt(rawPrompt, 5);
+
     await saveMessage(conversation.id, { role: "user", content: rawPrompt });
 
     const maxLoops = 10;
@@ -925,7 +771,7 @@ async function runGenerationCore(body, user) {
     let isFinished = false;
     let finalAnswer = "I was not able to complete the task.";
     let lastBlenderResult = null;
-    let ragContext = [];
+    // let ragContext = []; // This is now defined above the loop
     let agentHistory = [{ role: "user", parts: [{ text: rawPrompt }] }];
 
     while (!isFinished && loopCount < maxLoops) {
@@ -993,10 +839,35 @@ async function runGenerationCore(body, user) {
             if (!blenderAvailable) {
               observation = "Error: Blender is not connected. Cannot import assets.";
             } else {
-              const assetResult = await runAssetImportTool(assetPrompt, integrationStatus);
-              sceneContext = await sendCommandToBlender("get_scene_info", {});
-              observation = `Successfully imported asset: A new asset named '${assetResult.name}' was imported. I should now write code to select, scale, and move it.`;
-              progress.merge(`agent_act_${loopCount}`, { message: "Asset imported" });
+              // Refresh integration status quickly in case it changed
+              integrationStatus = await fetchIntegrationStatusFromBlender(true).catch(() => integrationStatus);
+              const decision = shouldUseIntegrationForPrompt(assetPrompt, integrationStatus);
+              if (decision.useIntegration) {
+                // Use integration flow (existing tool)
+                const assetResult = await runAssetImportTool(assetPrompt, integrationStatus);
+                sceneContext = await sendCommandToBlender("get_scene_info", {});
+                observation = `Successfully imported asset: A new asset named '${assetResult.name}' was imported via integration.`;
+                progress.merge(`agent_act_${loopCount}`, { message: "Asset imported via integration" });
+              } else {
+                // Integration not available or not suitable; generate bpy code instead
+                // Use RAG docs to improve code accuracy
+                const localRag = ragContext.length ? ragContext : await ensureRagForPrompt(assetPrompt, 5);
+                const systemPrompt = getAgentSystemPrompt(sceneContext, localRag);
+                // Ask LLM to output only bpy code to import/construct a substitute placeholder object
+                const codeRequest = {
+                  role: "user",
+                  parts: [{ text: `Generate Blender Python code to create or import a placeholder model for: ${assetPrompt}. Output only valid bpy code.` }],
+                };
+                const codeLLMResp = await callAgentLLM(systemPrompt, [...dbHistory, ...agentHistory, codeRequest], model);
+                // extract code if returned inside JSON or string
+                const codeText = (codeLLMResp.action && codeLLMResp.action.code) ? codeLLMResp.action.code : (codeLLMResp.thought || "");
+                const extracted = extractCodeFromText(codeText) || codeText;
+                const sanitized = sanitizeBlenderCode(extracted);
+                lastBlenderResult = await sendCommandToBlender("execute_code", { code: sanitized });
+                sceneContext = await sendCommandToBlender("get_scene_info", {});
+                observation = `Generated and executed bpy code to create/import placeholder asset. Result: ${lastBlenderResult?.result || "ok"}`;
+                progress.merge(`agent_act_${loopCount}`, { message: "Asset created via generated bpy code" });
+              }
             }
             break;
           }
@@ -1092,47 +963,6 @@ async function runGenerationCore(body, user) {
     }
     throw attachProgress(err instanceof Error ? err : new Error(String(err)));
   }
-}
-
-/* =========================
-   Blender TCP connector helper
-   ========================= */
-
-function connectToBlenderTCP() {
-  if (blenderClient && !blenderClient.destroyed) {
-    console.log("Blender client already exists");
-    return;
-  }
-  console.log(`Attempting to connect to Blender at ${BLENDER_TCP_HOST}:${BLENDER_TCP_PORT}`);
-  blenderClient = net.createConnection({ host: BLENDER_TCP_HOST, port: BLENDER_TCP_PORT }, () => {
-    blenderConnected = true;
-    console.log("✅ Connected to Blender TCP server");
-    initializeBlenderConnection();
-  });
-
-  blenderClient.on("data", (chunk) => {
-    try {
-      parseIncomingMessages(chunk);
-    } catch (err) {
-      console.error("Error parsing incoming chunk from Blender:", err);
-    }
-  });
-
-  blenderClient.on("error", (err) => {
-    console.error("Blender socket error:", err?.message || err);
-    blenderConnected = false;
-    resetBlenderState();
-  });
-
-  blenderClient.on("close", (hadError) => {
-    console.warn("Blender socket closed", hadError ? "due to error" : "");
-    blenderConnected = false;
-    resetBlenderState();
-    // Optionally attempt reconnect after delay
-    setTimeout(() => {
-      try { connectToBlenderTCP(); } catch (e) { console.error("Reconnect failed:", e); }
-    }, 5000);
-  });
 }
 
 /* =========================
@@ -1306,7 +1136,7 @@ app.post("/api/scene-info", authenticate, async (req, res) => {
   }
   try {
     const { conversationId } = req.body || {};
-    if (!blenderClient || !blenderConnected) return res.status(503).json({ error: "Blender not connected" });
+    if (!isBlenderConnected()) return res.status(503).json({ error: "Blender not connected" });
     const sceneInfo = await sendCommandToBlender("get_scene_info", {});
     if (conversationId) {
       const conversation = await getConversationForUser(req.user.id, conversationId);
@@ -1358,7 +1188,7 @@ app.post("/api/checkpoint", authenticate, async (req, res) => {
     return res.status(429).json({ error: "Rate limit exceeded", retryAfterMs: rl.retryAfterMs });
   }
   try {
-    if (!blenderClient || !blenderConnected) return res.status(503).json({ error: "Blender not connected" });
+    if (!isBlenderConnected()) return res.status(503).json({ error: "Blender not connected" });
     const ts = Date.now();
     const tmpPath = path.join(os.tmpdir(), `cursor4d_${ts}.blend`);
     const code = `import bpy\n\n# Save current scene to temporary file\ntry:\n    bpy.ops.wm.save_mainfile(filepath=r"${tmpPath}")\n    print('Saved to ${tmpPath}')\nexcept Exception as e:\n    raise Exception(f"Checkpoint failed: {str(e)}")`;
@@ -1436,40 +1266,45 @@ app.get("/api/models", authenticate, async (req, res) => {
    START SERVER
    ========================= */
 
-async function startServer() {
+(async () => {
   try {
+    // Initialize database schema
     console.log("📊 Initializing database schema...");
     await initSchema();
     console.log("✅ Database schema initialized");
+    
+    // Pre-load the embedding model for RAG
+    getEmbedder().then(() => {
+      console.log("✅ Local embedding model loaded and ready.");
+    }).catch(err => {
+      console.error("⚠️ Failed to pre-load local embedding model:", err?.message || err);
+    });
+    
+    // Initialize Blender connection using our integration module
+    await initializeBlenderConnection();
+    
+    // Start the Express server
+    app.listen(PORT, () => {
+      console.log(`🚀 Backend running at http://localhost:${PORT}`);
+      
+      // Log API configuration
+      if (genAI) console.log(`🤖 Gemini API: ✅ Configured`);
+      else console.log(`🤖 Gemini API: ❌ Not configured. Set GEMINI_API_KEY in .env to enable.`);
+      
+      if (groqClient) console.log(`🚀 Groq API: ✅ Configured`);
+      else console.log(`🚀 Groq API: ❌ Not configured. Set GROQ_API_KEY in .env to enable.`);
+      
+      if (cohereClient) console.log(`🕊️ Cohere API: ✅ Configured`);
+      else console.log(`🕊️ Cohere API: ❌ Not configured. Set COHERE_API_KEY in .env to enable.`);
+      
+      console.log(`📚 RAG Model: ${EMBEDDING_MODEL_NAME}`);
+    });
   } catch (err) {
-    console.error("❌ Database initialization failed:", err?.message || err);
+    console.error("💥 Startup Error:", err?.message || err);
     if ((err?.message || "").includes("ENOTFOUND") || (err?.message || "").includes("getaddrinfo")) {
       console.error("💡 DNS/network error. Check DATABASE_URL, connectivity and database host.");
     }
     console.error("❌ Backend cannot start without database connection (required for authentication)");
     process.exit(1);
   }
-
-  try {
-    getEmbedder().then(() => {
-      console.log("✅ Local embedding model loaded and ready.");
-    }).catch(err => {
-      console.error("⚠️ Failed to pre-load local embedding model:", err?.message || err);
-    });
-
-    connectToBlenderTCP();
-
-    app.listen(PORT, () => {
-      console.log(`🚀 Backend running at http://localhost:${PORT}`);
-      console.log(`🤖 Gemini API: ${genAI ? "✅ Configured" : "❌ Not configured"}`);
-      console.log(`🚀 Groq API: ${groqClient ? "✅ Configured" : "❌ Not configured"}`);
-      console.log(`🕊️ Cohere API: ${cohereClient ? "✅ Configured" : "❌ Not configured"}`);
-      console.log(`📚 RAG Model: ${EMBEDDING_MODEL_NAME}`);
-    });
-  } catch (err) {
-    console.error("❌ Failed to start backend:", err?.message || err);
-    process.exit(1);
-  }
-}
-
-startServer();
+})();

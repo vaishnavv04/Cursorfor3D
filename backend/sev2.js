@@ -1,6 +1,5 @@
 // sev.js (cleaned & consolidated)
 // ESM file - run with Node >= 18 (or adjust imports if using CommonJS)
-
 import express from "express";
 import cors from "cors";
 import bodyParser from "body-parser";
@@ -16,6 +15,8 @@ import pgvector from "pgvector/pg";
 
 import { pool, initSchema, mapConversation, mapMessage } from "./db.js";
 import { createProgressTracker } from "./utils/progress.js";
+import path from "node:path";
+import os from "node:os";
 
 dotenv.config();
 
@@ -146,7 +147,7 @@ async function callAgentLLM(systemPrompt, agentHistory, model = "gemini") {
   let rawResponseText = "";
 
   // Build history depending on target provider
-  // Gemini expects roles "user" and "model". Convert any "assistant" entries to "model".
+  // Gemini v1beta supports roles "user" and "model" only.
   const convertedHistory = agentHistory.map((h) => {
     if (h.role === "assistant") return { ...h, role: "model" };
     if (h.role === "system") return { role: "user", parts: [{ text: h.observation || h.parts?.[0]?.text || "" }] };
@@ -1359,7 +1360,7 @@ app.post("/api/checkpoint", authenticate, async (req, res) => {
   try {
     if (!blenderClient || !blenderConnected) return res.status(503).json({ error: "Blender not connected" });
     const ts = Date.now();
-    const tmpPath = require("path").join(require("os").tmpdir(), `cursor4d_${ts}.blend`);
+    const tmpPath = path.join(os.tmpdir(), `cursor4d_${ts}.blend`);
     const code = `import bpy\n\n# Save current scene to temporary file\ntry:\n    bpy.ops.wm.save_mainfile(filepath=r"${tmpPath}")\n    print('Saved to ${tmpPath}')\nexcept Exception as e:\n    raise Exception(f"Checkpoint failed: {str(e)}")`;
     const result = await executeBlenderCode(code);
     res.json({ status: "ok", path: tmpPath, result });

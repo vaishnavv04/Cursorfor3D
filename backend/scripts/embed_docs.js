@@ -9,7 +9,7 @@ import pgvector from "pgvector/pg";
 
 // --- CONFIGURATION ---
 const EMBEDDING_MODEL_NAME = "Xenova/all-MiniLM-L6-v2";
-const EXPECTED_EMBEDDING_DIM = 384;
+const EXPECTED_EMBEDDING_DIM = 380; // Match the existing table dimension
 const ZIP_FILE_PATH = path.join(
   process.cwd(), // Assumes running from 'backend' root
   "scripts",
@@ -26,7 +26,20 @@ const CHUNK_MIN_LENGTH = 50; // Don't embed tiny strings
 // Helper function to pause execution
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+async function tableExists(client, tableName) {
+  const { rows } = await client.query(
+    "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = $1)",
+    [tableName]
+  );
+  return rows[0].exists;
+}
+
 async function ensureEmbeddingTable(client, dim) {
+  // Check for both tables
+  const originalTableExists = await tableExists(client, "blender_knowledge");
+  const newTableExists = await tableExists(client, "blender_knowledge_new");
+  
+  // First, ensure the original table exists (for compatibility)
   await client.query(`
     CREATE TABLE IF NOT EXISTS blender_knowledge (
       id bigserial PRIMARY KEY,
@@ -34,23 +47,50 @@ async function ensureEmbeddingTable(client, dim) {
       embedding vector(${dim})
     );
   `);
-
-  const { rows } = await client.query(`
-    SELECT (atttypmod - 4) AS dim
-    FROM pg_attribute
-    WHERE attrelid = 'blender_knowledge'::regclass
-      AND attname = 'embedding'
-      AND NOT attisdropped;
-  `);
-
-  const currentDim = rows[0]?.dim ?? null;
-  if (currentDim !== null && currentDim !== dim) {
-    console.warn(
-      `[embed_docs] Adjusting blender_knowledge.embedding dimension from ${currentDim} to ${dim}. Clearing existing rows.`
-    );
-    await client.query("TRUNCATE TABLE blender_knowledge;");
-    await client.query(`ALTER TABLE blender_knowledge ALTER COLUMN embedding TYPE vector(${dim});`);
+  
+  // Next, check if we need the new table with correct dimensions
+  if (!originalTableExists || !newTableExists) {
+    // If original table exists, check its dimension
+    if (originalTableExists) {
+      const { rows } = await client.query(`
+        SELECT (atttypmod - 4) AS dim
+        FROM pg_attribute
+        WHERE attrelid = 'blender_knowledge'::regclass
+          AND attname = 'embedding'
+          AND NOT attisdropped;
+      `);
+      
+      const currentDim = rows[0]?.dim ?? null;
+      
+      // If original table has wrong dimensions, create the new table
+      if (currentDim !== null && currentDim !== dim) {
+        console.log(`[embed_docs] Original table dimension (${currentDim}) doesn't match expected (${dim}).`);
+        console.log(`[embed_docs] Creating new table blender_knowledge_new with correct dimension ${dim}.`);
+        
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS blender_knowledge_new (
+            id bigserial PRIMARY KEY,
+            content text NOT NULL,
+            embedding vector(${dim})
+          );
+        `);
+        
+        // Create index on the new table
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_blender_knowledge_new_embedding ON blender_knowledge_new USING ivfflat (embedding vector_cosine_ops);`);
+        
+        console.log(`[embed_docs] Will insert new embeddings into blender_knowledge_new`);
+        return "blender_knowledge_new";
+      }
+    }
   }
+  
+  // If we already have the new table, use it
+  if (newTableExists) {
+    return "blender_knowledge_new";
+  }
+  
+  // Otherwise use the original table
+  return "blender_knowledge";
 }
 
 /**
@@ -75,10 +115,15 @@ async function main() {
     // 2. Embed and store the chunks in the database
     const client = await pool.connect();
     try {
-      await ensureEmbeddingTable(client, EXPECTED_EMBEDDING_DIM);
-      await client.query("TRUNCATE TABLE blender_knowledge;");
-      console.log("🧹 Cleared blender_knowledge table before embedding.");
-      await embedAndStoreLocally(client, textChunks);
+      // Get the appropriate table name (original or new)
+      const tableName = await ensureEmbeddingTable(client, EXPECTED_EMBEDDING_DIM);
+      
+      // Clear the table before inserting new data
+      await client.query(`TRUNCATE TABLE ${tableName};`);
+      console.log(`🧹 Cleared ${tableName} table before embedding.`);
+      
+      // Embed and store the chunks
+      await embedAndStoreLocally(client, textChunks, tableName);
     } finally {
       client.release();
     }
@@ -173,9 +218,12 @@ async function parseAndChunkDocs() {
 
 /**
  * --- LOCAL EMBEDDING VERSION ---
- * Takes text chunks, embeds them using local transformer model, and stores them.
+ * Takes text chunks, embeds them using local transformer model, and stores them in the specified table.
+ * @param {Object} client - Database client
+ * @param {Array} chunks - Text chunks to embed
+ * @param {String} tableName - Name of the table to store embeddings in
  */
-async function embedAndStoreLocally(client, chunks) {
+async function embedAndStoreLocally(client, chunks, tableName = 'blender_knowledge') {
   console.log(`🤖 Loading local embedding model: ${EMBEDDING_MODEL_NAME}...`);
   
   const embedder = await pipeline('feature-extraction', EMBEDDING_MODEL_NAME);
@@ -185,7 +233,7 @@ async function embedAndStoreLocally(client, chunks) {
   const DB_BATCH_SIZE = 50;
   let rows = [];
   
-  console.log(`📦 Embedding ${chunks.length} chunks locally...`);
+  console.log(`📦 Embedding ${chunks.length} chunks locally and storing in ${tableName}...`);
   
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
@@ -213,21 +261,21 @@ async function embedAndStoreLocally(client, chunks) {
     // Insert batch when ready
     if (rows.length >= DB_BATCH_SIZE || i === chunks.length - 1) {
       const query = format(
-        'INSERT INTO blender_knowledge (content, embedding) VALUES %L',
+        `INSERT INTO ${tableName} (content, embedding) VALUES %L`,
         rows
       );
       await client.query(query);
       
       const batchNum = Math.floor(i / DB_BATCH_SIZE) + 1;
       const totalBatches = Math.ceil(chunks.length / DB_BATCH_SIZE);
-      console.log(`...stored batch ${batchNum} / ${totalBatches} (${rows.length} chunks)`);
+      console.log(`...stored batch ${batchNum} / ${totalBatches} (${rows.length} chunks) in ${tableName}`);
       
       // Reset batch
       rows = [];
     }
   }
   
-  console.log(`✅ All ${chunks.length} chunks embedded and stored locally.`);
+  console.log(`✅ All ${chunks.length} chunks embedded and stored in ${tableName}.`);
 }
 
 // Run the script

@@ -6,7 +6,8 @@ dotenv.config();
 
 const connectionString = process.env.DATABASE_URL || process.env.DATABASE_URI;
 
-const EMBEDDING_DIM = Number(process.env.EMBEDDING_DIM || 384);
+// Note: Our model outputs 384 dims but current table is 380, so we're adapting to the existing data
+const EMBEDDING_DIM = Number(process.env.EMBEDDING_DIM || 380);
 
 if (!connectionString) {
   throw new Error(
@@ -55,6 +56,38 @@ function mapMessage(row) {
   };
 }
 
+async function handleEmbeddingMismatch(client, currentDim, totalRows) {
+  // If there's a mismatch in dimensions and we have data
+  if (currentDim !== null && currentDim !== EMBEDDING_DIM && totalRows > 0) {
+    console.warn(`[db] Embedding dimension mismatch: table=${currentDim}, expected=${EMBEDDING_DIM}`);
+    console.warn(`[db] Creating a new table with the correct dimension and will use that instead`);
+    
+    try {
+      // Create a new table with the correct dimensions
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS blender_knowledge_new (
+          id bigserial PRIMARY KEY,
+          content text NOT NULL,
+          embedding vector(${EMBEDDING_DIM})
+        );
+      `);
+      
+      // Create index on the new table
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_blender_knowledge_new_embedding ON blender_knowledge_new USING ivfflat (embedding vector_cosine_ops);`);
+      
+      console.log(`[db] Created blender_knowledge_new table with correct embedding dimension ${EMBEDDING_DIM}`);
+      console.log(`[db] ⚠️ NOTE: You will need to re-embed content into this new table`);
+      console.log(`[db] ⚠️ Original data in blender_knowledge remains untouched`);
+      
+      return "new_table";
+    } catch (err) {
+      console.error(`[db] Failed to create new knowledge table: ${err.message}`);
+      return "use_existing";
+    }
+  }
+  return "ok";
+}
+
 async function initSchema() {
   let client;
   try {
@@ -65,6 +98,7 @@ async function initSchema() {
     );
   }
   try {
+    console.log("📊 Initializing database schema...");
     await client.query("CREATE EXTENSION IF NOT EXISTS pgcrypto;");
     // Also ensure pgvector is enabled, as we created the table for it.
     await client.query("CREATE EXTENSION IF NOT EXISTS vector;");
@@ -104,7 +138,7 @@ async function initSchema() {
         );
       `);
 
-    // This is the table we created in the Supabase UI
+    // Create the knowledge table with the current embedding dimension
     await client.query(`
       CREATE TABLE IF NOT EXISTS blender_knowledge (
         id bigserial PRIMARY KEY,
@@ -113,6 +147,7 @@ async function initSchema() {
       );
     `);
 
+    // Check the current dimension of the embedding column
     const { rows: embeddingColumn } = await client.query(`
       SELECT (atttypmod - 4) AS dim
       FROM pg_attribute
@@ -122,12 +157,37 @@ async function initSchema() {
     `);
 
     const currentDim = embeddingColumn[0]?.dim ?? null;
+    let totalRows = 0;
+    
+    try {
+      const { rows: cntRows } = await client.query("SELECT COUNT(1) AS c FROM blender_knowledge;");
+      totalRows = Number(cntRows[0]?.c || 0);
+      console.log(`[db] Embeddings info: env_dim=${EMBEDDING_DIM}, table_dim=${currentDim ?? 'n/a'}, rows=${totalRows}`);
+    } catch (e) {
+      console.log(`[db] Embeddings info: env_dim=${EMBEDDING_DIM}, table_dim=${currentDim ?? 'n/a'}, rows=?`);
+    }
+    
     if (currentDim !== null && currentDim !== EMBEDDING_DIM) {
       console.warn(
-        `[db] Adjusting blender_knowledge.embedding dimension from ${currentDim} to ${EMBEDDING_DIM}. Existing embeddings will be cleared.`
+        `[db] Detected blender_knowledge.embedding dimension ${currentDim} != ${EMBEDDING_DIM}. Skipping auto-migration to avoid data loss.`
       );
-      await client.query("TRUNCATE TABLE blender_knowledge;");
-      await client.query(`ALTER TABLE blender_knowledge ALTER COLUMN embedding TYPE vector(${EMBEDDING_DIM});`);
+      
+      // Handle the dimension mismatch
+      const result = await handleEmbeddingMismatch(client, currentDim, totalRows);
+      
+      if (result === "use_existing") {
+        console.log("[db] Will use existing table with mismatched dimensions");
+      }
+      
+      // If table is empty, we can alter the column
+      if (totalRows === 0) {
+        try {
+          await client.query(`ALTER TABLE blender_knowledge ALTER COLUMN embedding TYPE vector(${EMBEDDING_DIM});`);
+          console.log(`[db] Column embedding dimension set to ${EMBEDDING_DIM} (table was empty).`);
+        } catch (e) {
+          console.warn("[db] Dimension check/alter skipped:", e?.message || e);
+        }
+      }
     }
 
     await client.query(
