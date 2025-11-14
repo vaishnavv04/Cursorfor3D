@@ -20,6 +20,8 @@ CursorFor3D revolutionizes 3D content creation by combining the power of AI with
 - **Automatic Error Recovery**: Multi-agent system for automatic error detection and code repair
 - **Real-Time Progress Tracking**: Structured timeline events with detailed generation steps
 - **Visual Refinement**: Optional viewport screenshot analysis for iterative improvements
+- **RAG-Powered Knowledge Base**: Vector embeddings of Blender 4.5 Python API documentation for context-aware code generation
+- **Smart Integration Orchestration**: Automatic selection of optimal generation method based on prompt analysis
 
 ### 💻 Technical Architecture
 - **Blender MCP Integration**: Direct TCP communication with Blender's Model Context Protocol (port 9876)
@@ -29,6 +31,8 @@ CursorFor3D revolutionizes 3D content creation by combining the power of AI with
 - **Modern Frontend**: Electron + React with Tailwind CSS for responsive UI
 - **Backend API**: Node.js/Express server with PostgreSQL for data persistence
 - **Smart Caching**: LRU cache reduces redundant API calls for similar prompts
+- **Vector Database**: pgvector extension for semantic search of Blender API documentation
+- **RAG System**: Retrieval-Augmented Generation using Xenova transformers for context-aware code generation
 
 ## 🚀 Quick Start
 
@@ -38,7 +42,7 @@ CursorFor3D revolutionizes 3D content creation by combining the power of AI with
 - **Node.js 20+** and npm
 - **Google Gemini API key** (required for Blender code generation)
 - **Groq API key** (required for prompt enhancement)
-- **PostgreSQL** database (or Supabase)
+- **PostgreSQL** database (or Supabase) with pgvector extension
 - **Python 3.x** with virtual environment support
 - (Optional) **Sketchfab API key** for additional 3D model access
 
@@ -105,16 +109,25 @@ CursorFor3D revolutionizes 3D content creation by combining the power of AI with
    npm install
    ```
 
-6. **Set up PostgreSQL database**
+6. **Set up PostgreSQL database with pgvector**
    
-   Create a database and run the schema initialization:
+   Create a database and enable the pgvector extension:
    ```sql
    CREATE DATABASE cursor3d;
+   \c cursor3d;
+   CREATE EXTENSION IF NOT EXISTS vector;
    ```
    
    The schema will be automatically initialized on first run.
 
-7. **Set up Blender**
+7. **Initialize the knowledge base (optional but recommended)**
+   ```bash
+   cd backend
+   node scripts/embed_docs.js
+   ```
+   This will embed the Blender 4.5 Python API documentation for enhanced code generation.
+
+8. **Set up Blender**
    - Install Blender 4.5 or higher
    - Install and enable the MCP add-on
    - Configure it to listen on `127.0.0.1:9876`
@@ -201,13 +214,18 @@ CursorFor3D/
 │   ├── db.js                  # PostgreSQL database configuration
 │   ├── package.json           # Backend dependencies
 │   ├── integrations/          # External service integrations
-│   │   ├── hyper3d.js        # Hyper3D/Rodin API integration
-│   │   ├── polyhaven.js      # PolyHaven asset integration
-│   │   ├── sketchfab.js      # Sketchfab API integration
+│   │   ├── index.js           # Central integration orchestrator
+│   │   ├── hyper3d.js         # Hyper3D/Rodin API integration
+│   │   ├── polyhaven.js       # PolyHaven asset integration
+│   │   ├── sketchfab.js       # Sketchfab API integration
 │   │   └── check_integration.js  # Integration status checks
+│   ├── scripts/               # Utility and setup scripts
+│   │   ├── embed_docs.js      # Knowledge base embedding script
+│   │   └── knowledge/         # Blender API documentation
+│   │       ├── blender_api.txt
+│   │       └── blender_python_reference_4_5.zip
 │   ├── utils/                 # Utility modules
-│   │   ├── progress.js       # Progress tracking system
-│   │   └── hyper3dPrompt.js  # Hyper3D prompt helpers
+│   │   └── progress.js        # Progress tracking system
 │   └── venv-mcp/             # Python virtual environment
 ├── frontend/                  # React + Electron desktop app
 │   ├── main.js               # Electron main process
@@ -297,6 +315,8 @@ The system generates Blender 4.5-compatible Python code with strict validation:
 - Fix for Blender 4.5 API changes (Voronoi/Musgrave node updates)
 - Safe deletion patterns and edit mode handling
 - Error-specific hints for common issues
+- **RAG-Enhanced Generation**: Uses vector embeddings of Blender API documentation for context-aware code suggestions
+- **Semantic Search**: Retrieves relevant API documentation based on prompt context using pgvector similarity search
 
 ### Smart Caching
 - **LRU Cache**: Stores generated code with SHA-256 hash keys
@@ -326,6 +346,8 @@ Structured timeline with stages:
 - `users` - User accounts with bcrypt password hashing
 - `conversations` - Chat sessions with scene context
 - `messages` - Conversation messages with metadata
+- `blender_knowledge` - Vector embeddings of Blender API documentation (380-dimensional)
+- `blender_knowledge_new` - Enhanced knowledge base with improved chunking strategy
 
 All timestamps use PostgreSQL `TIMESTAMP WITH TIME ZONE` for consistency.
 
@@ -349,6 +371,8 @@ All timestamps use PostgreSQL `TIMESTAMP WITH TIME ZONE` for consistency.
 | `CODE_CACHE_TTL_MS` | No | 300000 | Cache TTL in milliseconds |
 | `RATE_LIMIT_WINDOW_MS` | No | 60000 | Rate limit window |
 | `RATE_LIMIT_MAX` | No | 30 | Max requests per window |
+| `EMBEDDING_DIM` | No | 380 | Dimension for vector embeddings |
+| `EMBEDDING_MODEL` | No | Xenova/all-MiniLM-L6-v2 | Model for knowledge base embeddings |
 
 ## 🤝 Contributing
 
@@ -377,6 +401,9 @@ We welcome contributions! Here's how you can help:
 - Bug fixes and error handling
 - Documentation improvements
 - Test coverage
+- **Knowledge Base Enhancement**: Add more Blender API documentation and tutorials
+- **RAG System Improvements**: Better chunking strategies and embedding models
+- **Integration Development**: Create new asset source integrations
 
 ## � Troubleshooting
 
@@ -405,7 +432,13 @@ We welcome contributions! Here's how you can help:
   - Verify PostgreSQL is running
   - Check `DATABASE_URL` format: `postgresql://user:password@host:port/database`
   - Ensure database exists: `CREATE DATABASE cursor3d;`
+  - **Enable pgvector extension**: `CREATE EXTENSION IF NOT EXISTS vector;`
   - Check PostgreSQL logs for connection errors
+
+- **"pgvector extension not found"**
+  - Install pgvector: https://github.com/pgvector/pgvector#installation
+  - Enable extension in your database: `CREATE EXTENSION IF NOT EXISTS vector;`
+  - Restart PostgreSQL server after installation
 
 #### Authentication Issues
 - **"JWT_SECRET environment variable is required"**
@@ -434,6 +467,18 @@ We welcome contributions! Here's how you can help:
   - Ensure backend is running on port 5000
   - Check for port conflicts
   - Verify frontend is configured to connect to correct backend URL
+
+#### Knowledge Base Issues
+- **"Knowledge base not initialized"**
+  - Run: `cd backend && node scripts/embed_docs.js`
+  - Ensure `scripts/knowledge/blender_python_reference_4_5.zip` exists
+  - Check that pgvector extension is enabled in database
+  - Verify `EMBEDDING_DIM` matches database table dimensions
+
+- **"Embedding model loading failed"**
+  - Check internet connection for model download (first run only)
+  - Ensure sufficient disk space for model cache
+  - Verify `@xenova/transformers` dependency is installed
 
 ### Debug Mode
 Enable debug mode for detailed information:
@@ -483,6 +528,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [ ] Cloud rendering support
 - [ ] Mobile companion app
 - [ ] Plugin system for extensibility
+- [ ] Advanced RAG capabilities with tutorial embeddings
+- [ ] Real-time collaboration features
+- [ ] Version control for scene iterations
 
 ### In Progress
 - [x] Hyper3D integration for realistic models
@@ -491,6 +539,10 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [x] Error recovery system
 - [x] Progress tracking
 - [x] Prompt enhancement
+- [x] RAG-powered knowledge base with Blender API documentation
+- [x] Vector database integration with pgvector
+- [x] Smart integration orchestration system
+- [x] Semantic search for API documentation
 
 ---
 
