@@ -174,8 +174,10 @@ export function sendCommand(commandType, params = {}) {
 function enqueueCommand(commandType, params, resolve, reject) {
     // Determine timeout based on command type
     let timeoutMs = 15000; // Default 15s
-    if (commandType.startsWith('download_') || commandType.includes('download')) {
-      timeoutMs = 60000; // 60s for downloads
+    if (commandType === 'download_sketchfab_model') {
+      timeoutMs = 120000; // 120s (2 minutes) for Sketchfab downloads (can be large files)
+    } else if (commandType.startsWith('download_') || commandType.includes('download')) {
+      timeoutMs = 60000; // 60s for other downloads
     } else if (commandType.startsWith('create_rodin_job')) {
       timeoutMs = 30000; // 30s for job creation
     } else if (commandType.startsWith('search_')) {
@@ -305,14 +307,11 @@ export const integrationModules = {
     const sketchfabKeywords = ["sketchfab", "specific model", "brand name", "realistic car", "eames chair", "starship"];
     const polyhavenKeywords = ["polyhaven", "texture", "hdri", "material", "generic", "simple chair", "basic furniture", "wooden chair", "table"];
 
+    // Check Hyper3D first (most specific)
     if (integrationStatus?.hyper3d && hyper3dKeywords.some(k => p.includes(k))) 
       return { type: "hyper3d", prompt: promptText };
 
-    if (integrationStatus?.sketchfab && sketchfabKeywords.some(k => p.includes(k))) {
-      const query = p.replace("sketchfab", "").replace("add", "").trim();
-      return { type: "sketchfab", query: query || "realistic model" };
-    }
-
+    // Check PolyHaven (textures, HDRIs, generic models)
     if (integrationStatus?.polyhaven) {
       if (p.includes("hdri") || p.includes("sky texture")) {
         const query = p.replace("hdri", "").replace("sky texture", "").trim();
@@ -325,6 +324,26 @@ export const integrationModules = {
       if (polyhavenKeywords.some(k => p.includes(k))) {
         const query = p.replace("polyhaven", "").trim();
         return { type: "polyhaven", asset_type: "models", query: query || p };
+      }
+    }
+
+    // Check Sketchfab (explicit keywords or fallback if it's the only available integration)
+    if (integrationStatus?.sketchfab) {
+      if (sketchfabKeywords.some(k => p.includes(k))) {
+        const query = p.replace("sketchfab", "").replace("add", "").trim();
+        return { type: "sketchfab", query: query || "realistic model" };
+      }
+      
+      // Fallback: If Sketchfab is the only enabled integration and no other keywords match, use Sketchfab
+      const enabledIntegrations = [
+        integrationStatus?.hyper3d,
+        integrationStatus?.polyhaven,
+        integrationStatus?.sketchfab
+      ].filter(Boolean).length;
+      
+      if (enabledIntegrations === 1 && integrationStatus?.sketchfab) {
+        // Only Sketchfab is enabled, default to it
+        return { type: "sketchfab", query: promptText };
       }
     }
     

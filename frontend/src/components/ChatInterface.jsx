@@ -44,6 +44,10 @@ const ChatInterface = () => {
   const [enhancedPromptText, setEnhancedPromptText] = useState("");
   const [attachments, setAttachments] = useState([]);
   const [progress, setProgress] = useState([]);
+  const [isConvertingTo3D, setIsConvertingTo3D] = useState(false);
+  const [show3DModel, setShow3DModel] = useState(false);
+  const [current3DModel, setCurrent3DModel] = useState(null);
+  const modelViewerRef = useRef(null);
     // hard-coded model
   const selectedModel = "gemini";
   const [enhancing, setEnhancing] = useState(false);
@@ -537,6 +541,50 @@ const ChatInterface = () => {
     selectedModel,
   ]);
 
+  // Convert image to 3D model
+  const convertImageTo3D = useCallback(async (file) => {
+    if (!file || !file.type.startsWith('image/')) {
+      setError("Please select a valid image file");
+      return;
+    }
+
+    setIsConvertingTo3D(true);
+    setError("");
+
+    try {
+      // Read file as data URL
+      const reader = new FileReader();
+      const dataUrl = await new Promise((resolve, reject) => {
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+
+      // Create attachment
+      const attachment = {
+        id: `${Date.now()}_${Math.random()}_${file.name}`,
+        name: file.name,
+        type: file.type,
+        size: file.size,
+        dataUrl: dataUrl,
+      };
+
+      // Set as attachment and send with prompt
+      setAttachments([attachment]);
+      setInput("Convert this image to a 3D model using Hyper3D or Sketchfab");
+      
+      // Auto-send after a brief delay to allow state to update
+      setTimeout(() => {
+        handleSend();
+      }, 100);
+    } catch (err) {
+      console.error("Error converting image to 3D", err);
+      setError("Failed to process image. Please try again.");
+    } finally {
+      setIsConvertingTo3D(false);
+    }
+  }, [handleSend]);
+
   const handleKeyDown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -720,6 +768,147 @@ const ChatInterface = () => {
     }
   }, [handleDeleteConversation]);
 
+  // Helper function to format assistant message content with conversational explanations and collapsible code blocks
+  const formatAssistantMessage = useCallback((content) => {
+    if (!content) return null;
+
+    // Check if content contains code blocks (markdown-style)
+    const codeBlockRegex = /```(\w+)?\n([\s\S]*?)```/g;
+    const hasCodeBlocks = codeBlockRegex.test(content);
+
+    // If no code blocks, return simple formatted text
+    if (!hasCodeBlocks) {
+      return (
+        <div className="space-y-3">
+          <p className="text-sm text-slate-700 dark:text-gray-300 whitespace-pre-wrap break-words">
+            {content}
+          </p>
+        </div>
+      );
+    }
+
+    // Reset regex
+    codeBlockRegex.lastIndex = 0;
+
+    // Split content into parts (text and code blocks)
+    const parts = [];
+    let lastIndex = 0;
+    let match;
+    let stepNumber = 1;
+
+    while ((match = codeBlockRegex.exec(content)) !== null) {
+      // Add text before code block
+      const textBefore = content.substring(lastIndex, match.index).trim();
+      if (textBefore) {
+        parts.push({ type: 'text', content: textBefore });
+      }
+
+      // Add code block
+      const language = match[1] || 'python';
+      const code = match[2].trim();
+      
+      // Try to extract a meaningful description from the text before
+      let codeDescription = '';
+      if (textBefore) {
+        // Look for step patterns like "Step 1:", "1.", or sentence before code
+        const stepMatch = textBefore.match(/(?:Step\s+\d+[:\-]?\s*|^\d+[\.\)]\s*)(.+?)(?:\.|$)/i);
+        if (stepMatch && stepMatch[1]) {
+          codeDescription = stepMatch[1].trim();
+        } else {
+          // Take the last sentence or last 50 chars
+          const sentences = textBefore.split(/[.!?]\s+/);
+          codeDescription = sentences[sentences.length - 1].trim();
+          if (codeDescription.length > 60) {
+            codeDescription = codeDescription.substring(0, 57) + '...';
+          }
+        }
+      }
+      
+      if (!codeDescription) {
+        codeDescription = `Step ${stepNumber} – Blender Python code`;
+      } else {
+        codeDescription = `Step ${stepNumber} – ${codeDescription}`;
+      }
+      
+      parts.push({ type: 'code', language, code, description: codeDescription });
+      stepNumber++;
+      lastIndex = match.index + match[0].length;
+    }
+
+    // Add remaining text after last code block
+    const textAfter = content.substring(lastIndex).trim();
+    if (textAfter) {
+      parts.push({ type: 'text', content: textAfter });
+    }
+
+    // If we found code blocks but no text before them, treat the whole thing as a code block
+    if (parts.length === 0 || (parts.length === 1 && parts[0].type === 'code')) {
+      const simpleCodeMatch = content.match(/```(\w+)?\n([\s\S]*?)```/);
+      if (simpleCodeMatch) {
+        const language = simpleCodeMatch[1] || 'python';
+        const code = simpleCodeMatch[2].trim();
+        return (
+          <div className="space-y-3">
+            <p className="text-sm text-slate-700 dark:text-gray-300 mb-3">
+              I'll help you create this 3D scene. Here's the Blender Python code to accomplish this:
+            </p>
+            <details className="border border-slate-200 dark:border-gray-700 rounded-lg overflow-hidden">
+              <summary className="px-4 py-2 bg-slate-100 dark:bg-gray-800 cursor-pointer hover:bg-slate-200 dark:hover:bg-gray-700 text-sm font-medium text-slate-700 dark:text-gray-300">
+                Step 1 – Blender Python code
+              </summary>
+              <pre className="text-xs bg-slate-50 dark:bg-gray-900/50 p-4 overflow-x-auto border-t border-slate-200 dark:border-gray-700">
+                <code className="text-slate-800 dark:text-gray-300">{code}</code>
+              </pre>
+            </details>
+          </div>
+        );
+      }
+    }
+
+    // Build structured response
+    const elements = [];
+    let currentStep = 1;
+    let introText = '';
+
+    parts.forEach((part, index) => {
+      if (part.type === 'text') {
+        // First text block is the introduction
+        if (index === 0) {
+          introText = part.content;
+        } else {
+          // Subsequent text blocks are explanations between steps
+          elements.push(
+            <p key={`text-${index}`} className="text-sm text-slate-700 dark:text-gray-300 mt-3">
+              {part.content}
+            </p>
+          );
+        }
+      } else if (part.type === 'code') {
+        elements.push(
+          <details key={`code-${index}`} className="border border-slate-200 dark:border-gray-700 rounded-lg overflow-hidden mt-3">
+            <summary className="px-4 py-2 bg-slate-100 dark:bg-gray-800 cursor-pointer hover:bg-slate-200 dark:hover:bg-gray-700 text-sm font-medium text-slate-700 dark:text-gray-300">
+              {part.description}
+            </summary>
+            <pre className="text-xs bg-slate-50 dark:bg-gray-900/50 p-4 overflow-x-auto border-t border-slate-200 dark:border-gray-700">
+              <code className="text-slate-800 dark:text-gray-300">{part.code}</code>
+            </pre>
+          </details>
+        );
+        currentStep++;
+      }
+    });
+
+    return (
+      <div className="space-y-3">
+        {introText && (
+          <p className="text-sm text-slate-700 dark:text-gray-300 mb-3">
+            {introText}
+          </p>
+        )}
+        {elements}
+      </div>
+    );
+  }, []);
 
   const primaryNav = useMemo(
     () => [
@@ -1141,10 +1330,7 @@ const ChatInterface = () => {
                       )}
                       {message.content && (
                         <div>
-                          <p className="text-xs text-slate-500 dark:text-gray-400 mb-2 font-medium">Generated Code:</p>
-                          <pre className="text-xs bg-slate-100 rounded-lg p-3 overflow-x-auto border border-slate-200 dark:bg-gray-900/50 dark:border-gray-700/30">
-                            <code className="text-slate-800 dark:text-gray-300">{message.content}</code>
-                          </pre>
+                          {formatAssistantMessage(message.content)}
                         </div>
                       )}
                     </div>
@@ -1294,37 +1480,63 @@ const ChatInterface = () => {
                     </svg>
                   )}
                 </button>
-                <label 
-                  className="absolute right-12 bottom-2 p-2 rounded-lg bg-slate-100 border border-slate-200 text-slate-600 hover:bg-slate-200 cursor-pointer transition-colors dark:bg-gray-800 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-gray-700"
-                  title="Upload images or PDFs"
-                >
-                  <input 
-                    ref={fileInputRef}
-                    type="file" 
-                    accept="image/*,application/pdf" 
-                    className="hidden" 
-                    multiple 
-                    onChange={(e) => {
-                      onAttachFiles(e.target.files);
-                      // Reset input so same file can be selected again
-                      if (fileInputRef.current) {
-                        fileInputRef.current.value = '';
-                      }
-                    }} 
-                  />
-                  <svg className="w-5 h-5 text-slate-600 dark:text-gray-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                  </svg>
-                </label>
-                <button
-                  onClick={handleSend}
-                  disabled={(!input.trim() && attachments.length === 0) || loading}
-                  className="absolute right-2 bottom-2 p-2 rounded-lg bg-gradient-to-r from-pink-600 to-purple-600 hover:from-pink-500 hover:to-purple-500 disabled:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50 transition-colors"
-                >
-                  <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
-                  </svg>
-                </button>
+                <div className="absolute right-12 bottom-2 flex gap-1">
+                  <label 
+                    className="p-2 rounded-lg bg-slate-100 border border-slate-200 text-slate-600 hover:bg-slate-200 cursor-pointer transition-colors dark:bg-gray-800 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-gray-700"
+                    title="Upload images"
+                  >
+                    <input 
+                      ref={fileInputRef}
+                      type="file" 
+                      accept="image/*" 
+                      className="hidden" 
+                      multiple 
+                      onChange={async (e) => {
+                        const files = Array.from(e.target.files);
+                        // Check if any file is selected
+                        if (files.length > 0) {
+                          // If it's a single image, ask if user wants to convert to 3D
+                          if (files.length === 1 && files[0].type.startsWith('image/')) {
+                            if (window.confirm('Do you want to convert this image to a 3D model?')) {
+                              await convertImageTo3D(files[0]);
+                              // Reset input
+                              if (fileInputRef.current) {
+                                fileInputRef.current.value = '';
+                              }
+                              return;
+                            }
+                          }
+                          // If not converting to 3D or multiple files, handle as regular attachments
+                          onAttachFiles(e.target.files);
+                        }
+                        // Reset input so same file can be selected again
+                        if (fileInputRef.current) {
+                          fileInputRef.current.value = '';
+                        }
+                      }} 
+                    />
+                    <svg className="w-5 h-5 text-slate-600 dark:text-gray-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                    </svg>
+                  </label>
+                </div>
+                <div className="absolute right-2 bottom-2 flex gap-1">
+                  <button
+                    onClick={handleSend}
+                    disabled={(!input.trim() && attachments.length === 0) || loading || isConvertingTo3D}
+                    className="p-2 rounded-lg bg-gradient-to-r from-pink-600 to-purple-600 hover:from-pink-500 hover:to-purple-500 disabled:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50 transition-colors"
+                    title="Send message"
+                  >
+                    <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+                    </svg>
+                  </button>
+                  {isConvertingTo3D && (
+                    <div className="absolute -top-8 right-0 bg-gray-800 text-white text-xs px-2 py-1 rounded">
+                      Converting to 3D...
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
             {/* <p className="text-xs text-slate-500 dark:text-gray-500 mt-2 text-center">

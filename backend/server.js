@@ -15,7 +15,9 @@ import pgvector from "pgvector/pg";
 
 import { pool, initSchema, mapConversation, mapMessage } from "./db.js";
 import { createProgressTracker } from "./utils/progress.js";
+import { getRandomGeminiKey } from "./utils/simple-api-keys.js";
 import { integrationModules, initBlenderConnection, sendCommand, isBlenderConnected } from './integrations/index.js';
+import { runLangGraphAgent } from "./langgraph-agent.js";
 import path from "node:path";
 import os from "node:os";
 
@@ -39,9 +41,14 @@ if (!JWT_SECRET) {
 }
 
 // Initialize AI providers (may be null if key missing)
-const genAI = process.env.GEMINI_API_KEY ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY) : null;
 const groqClient = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
 const cohereClient = process.env.COHERE_API_KEY ? new CohereClient({ token: process.env.COHERE_API_KEY }) : null;
+
+// Dynamic Gemini client creation function
+async function createGeminiClient() {
+  const apiKey = getRandomGeminiKey();
+  return apiKey ? new GoogleGenerativeAI(apiKey) : null;
+}
 
 // Model configs
 const MODEL_CONFIGS = {
@@ -196,7 +203,9 @@ async function callAgentLLM(systemPrompt, agentHistory, model = "gemini") {
 
   switch (model) {
     case "gemini": {
+      const genAI = await createGeminiClient();
       if (!genAI) throw new Error("Gemini API not configured");
+      
       const modelClient = genAI.getGenerativeModel({
         model: MODEL_CONFIGS.gemini.name,
         generationConfig: { responseMimeType: "application/json", temperature: 0.3 },
@@ -696,12 +705,11 @@ Enhanced prompt:
 }
 
 /* =========================
-   AGENT ReAct core - runGenerationCore
+   LangGraph AGENT core - runGenerationCore
    ========================= */
-
 async function runGenerationCore(body, user) {
   const { prompt, conversationId, attachments = [], captureScreenshot = false, debug = false, model = "gemini" } = body || {};
-  console.log(`[Agent] Starting new generation task. Model: ${model}, User: ${user.id}`);
+  console.log(`[LangGraph Agent] Starting new generation task. Model: ${model}, User: ${user.id}`);
   const startedAt = Date.now();
   const progress = createProgressTracker();
   let analyticsRecorded = false;
@@ -712,7 +720,7 @@ async function runGenerationCore(body, user) {
   };
 
   try {
-    progress.add("init", "Starting ReAct agent workflow");
+    progress.add("init", "Starting LangGraph agent workflow");
     const rawPrompt = typeof prompt === "string" ? prompt.trim() : "";
     if (!rawPrompt) throw attachProgress(new Error("Prompt required"));
 
@@ -729,22 +737,12 @@ async function runGenerationCore(body, user) {
       progress.merge("conversation_create", { message: "Conversation created", data: { conversationId: conversation.id } });
     }
 
-    const dbHistory = (await getMessagesForHistory(conversation.id, 10)).map(msg => ({ role: msg.role, parts: [{ text: msg.parts[0].text }] }));
+    // Save user message
+    await saveMessage(conversation.id, { role: "user", content: rawPrompt });
 
+    // Get initial scene context if Blender is connected
     let sceneContext = conversation.lastSceneContext || null;
     const blenderAvailable = isBlenderConnected();
-
-    // fetch current integration status (cached)
-    let integrationStatus = { hyper3d: false, polyhaven: false, sketchfab: false };
-    if (blenderAvailable) {
-      progress.add("integration_fetch", "Checking addon integration availability");
-      try {
-        integrationStatus = await fetchIntegrationStatusFromBlender().catch(e => integrationStatus);
-        progress.merge("integration_fetch", { message: "Integration status fetched", data: integrationStatus });
-      } catch (e) {
-        progress.addError("integration_fetch", "Failed to fetch integrations", e?.message || String(e));
-      }
-    }
 
     if (blenderAvailable) {
       progress.add("context_fetch", "Fetching context from Blender...");
@@ -761,201 +759,82 @@ async function runGenerationCore(body, user) {
       progress.add("context_skipped", "Blender not connected, using cached context");
     }
 
-    // Pre-warm RAG context for the user prompt (agent will use it on search_knowledge_base or before code generation)
-    let ragContext = await ensureRagForPrompt(rawPrompt, 5);
+    progress.add("agent_execution", "Running LangGraph agent workflow");
 
-    await saveMessage(conversation.id, { role: "user", content: rawPrompt });
-
-    const maxLoops = 10;
-    let loopCount = 0;
-    let isFinished = false;
-    let finalAnswer = "I was not able to complete the task.";
-    let lastBlenderResult = null;
-    // let ragContext = []; // This is now defined above the loop
-    let agentHistory = [{ role: "user", parts: [{ text: rawPrompt }] }];
-
-    while (!isFinished && loopCount < maxLoops) {
-      loopCount++;
-      progress.add(`agent_loop_${loopCount}`, `Agent reasoning loop ${loopCount} / ${maxLoops}`);
-
-      const systemPrompt = getAgentSystemPrompt(sceneContext, ragContext);
-      const llmHistory = [...dbHistory, ...agentHistory];
-
-      console.log(`🤖 [Agent] Loop ${loopCount}: Thinking...`);
-      let agentResponse;
-      try {
-        agentResponse = await callAgentLLM(systemPrompt, llmHistory, model);
-      } catch (err) {
-        progress.addError(`agent_reason_${loopCount}`, "Agent reasoning failed (LLM call)", err?.message || String(err));
-        throw attachProgress(new Error(`Agent reasoning failed: ${err?.message || String(err)}`));
-      }
-
-      const { thought, action } = agentResponse;
-      if (!thought || !action || !action.name) {
-        progress.addError(`agent_reason_${loopCount}`, "Agent returned malformed JSON");
-        throw attachProgress(new Error(`Agent returned malformed JSON: ${JSON.stringify(agentResponse)}`));
-      }
-
-      progress.merge(`agent_reason_${loopCount}`, { message: `Thought: ${summarizeText(thought, 100)}` });
-      console.log(`🤖 [Agent] Thought: ${thought}`);
-      console.log(`🤖 [Agent] Action: ${action.name}`, action.args || "");
-      agentHistory.push({ role: "assistant", parts: [{ text: JSON.stringify(agentResponse) }] });
-
-      // ACT
-      progress.add(`agent_act_${loopCount}`, `Executing tool: ${action.name}`);
-      let observation = "";
-      try {
-        switch (action.name) {
-          case "finish_task": {
-            isFinished = true;
-            finalAnswer = thought;
-            observation = "Task finished.";
-            progress.merge(`agent_act_${loopCount}`, { message: "Task finished" });
-            break;
-          }
-          case "get_scene_info": {
-            if (!blenderAvailable) {
-              observation = "Error: Blender is not connected. I cannot see the scene.";
-            } else {
-              sceneContext = await sendCommandToBlender("get_scene_info", {});
-              observation = `Scene info updated. Current objects: ${Array.isArray(sceneContext.objects) ? sceneContext.objects.join(", ") : "unknown"}`;
-              progress.merge(`agent_act_${loopCount}`, { message: "Scene info retrieved" });
-            }
-            break;
-          }
-          case "search_knowledge_base": {
-            const query = action.query || "";
-            if (!query) {
-              observation = "Error: No query provided for knowledge base search.";
-            } else {
-              ragContext = await searchKnowledgeBase(query);
-              observation = `Knowledge base search for "${query}" returned ${Array.isArray(ragContext) ? ragContext.length : 0} documents. I will use this to write my code.`;
-              progress.merge(`agent_act_${loopCount}`, { message: "Knowledge base searched" });
-            }
-            break;
-          }
-          case "asset_search_and_import": {
-            const assetPrompt = action.prompt || rawPrompt;
-            if (!blenderAvailable) {
-              observation = "Error: Blender is not connected. Cannot import assets.";
-            } else {
-              // Refresh integration status quickly in case it changed
-              integrationStatus = await fetchIntegrationStatusFromBlender(true).catch(() => integrationStatus);
-              const decision = shouldUseIntegrationForPrompt(assetPrompt, integrationStatus);
-              if (decision.useIntegration) {
-                // Use integration flow (existing tool)
-                const assetResult = await runAssetImportTool(assetPrompt, integrationStatus);
-                sceneContext = await sendCommandToBlender("get_scene_info", {});
-                observation = `Successfully imported asset: A new asset named '${assetResult.name}' was imported via integration.`;
-                progress.merge(`agent_act_${loopCount}`, { message: "Asset imported via integration" });
-              } else {
-                // Integration not available or not suitable; generate bpy code instead
-                // Use RAG docs to improve code accuracy
-                const localRag = ragContext.length ? ragContext : await ensureRagForPrompt(assetPrompt, 5);
-                const systemPrompt = getAgentSystemPrompt(sceneContext, localRag);
-                // Ask LLM to output only bpy code to import/construct a substitute placeholder object
-                const codeRequest = {
-                  role: "user",
-                  parts: [{ text: `Generate Blender Python code to create or import a placeholder model for: ${assetPrompt}. Output only valid bpy code.` }],
-                };
-                const codeLLMResp = await callAgentLLM(systemPrompt, [...dbHistory, ...agentHistory, codeRequest], model);
-                // extract code if returned inside JSON or string
-                const codeText = (codeLLMResp.action && codeLLMResp.action.code) ? codeLLMResp.action.code : (codeLLMResp.thought || "");
-                const extracted = extractCodeFromText(codeText) || codeText;
-                const sanitized = sanitizeBlenderCode(extracted);
-                lastBlenderResult = await sendCommandToBlender("execute_code", { code: sanitized });
-                sceneContext = await sendCommandToBlender("get_scene_info", {});
-                observation = `Generated and executed bpy code to create/import placeholder asset. Result: ${lastBlenderResult?.result || "ok"}`;
-                progress.merge(`agent_act_${loopCount}`, { message: "Asset created via generated bpy code" });
-              }
-            }
-            break;
-          }
-          case "execute_blender_code": {
-            const code = action.code || "";
-            if (!code) {
-              observation = "Error: No code provided for execution.";
-            } else if (!blenderAvailable) {
-              observation = "Error: Blender is not connected. Cannot execute code.";
-            } else {
-              const sanitizedCode = sanitizeBlenderCode(code);
-              lastBlenderResult = await sendCommandToBlender("execute_code", { code: sanitizedCode });
-              sceneContext = await sendCommandToBlender("get_scene_info", {});
-              if (lastBlenderResult?.status === "error" || lastBlenderResult?.executed === false) {
-                const errorMsg = lastBlenderResult?.error || lastBlenderResult?.result || "Unknown execution error";
-                observation = `Code execution FAILED: ${errorMsg}. I must analyze this error and try again.`;
-                progress.addError(`agent_act_${loopCount}`, "Code execution failed", errorMsg);
-              } else {
-                const resultText = lastBlenderResult?.result || "No output";
-                observation = `Code executed successfully. Output: ${resultText}. Scene now has ${sceneContext?.object_count ?? "unknown"} objects.`;
-                progress.merge(`agent_act_${loopCount}`, { message: "Code executed successfully" });
-              }
-            }
-            break;
-          }
-          default: {
-            observation = `Error: Unknown action '${action.name}'. I must choose from the provided tool list.`;
-            progress.addError(`agent_act_${loopCount}`, "Unknown action", action.name);
-          }
-        }
-      } catch (err) {
-        observation = `Tool execution error: ${err?.message || String(err)}. I will try to recover.`;
-        progress.addError(`agent_act_${loopCount}`, "Tool execution error", err?.message || String(err));
-      }
-
-      console.log(`🤖 [Agent] Observation: ${summarizeText(observation, 200)}...`);
-      agentHistory.push({ role: "user", parts: [{ text: "Observation: " + observation }] });
-      progress.merge(`agent_loop_${loopCount}`, { message: `Loop ${loopCount} completed` });
-    }
-
-    if (!isFinished) {
-      progress.addError("agent_max_loops", "Agent reached maximum loops without finishing");
-      finalAnswer = "I reached my maximum reasoning steps (10) without completing the task. Please try breaking down your request into smaller steps.";
-    }
-
-    analytics.totalGenerations += 1;
-    analytics.totalDurationMs += Date.now() - startedAt;
-    analytics.success += isFinished ? 1 : 0;
-    analytics.errors += isFinished ? 0 : 1;
-    analyticsRecorded = true;
-
-    let screenshot = null;
-    if (captureScreenshot && blenderAvailable) {
-      // optional screenshot logic
-    }
-
-    await saveMessage(conversation.id, {
-      role: "assistant",
-      content: finalAnswer,
-      provider: model,
-      blenderResult: lastBlenderResult,
+    // Run the LangGraph agent
+    const agentResult = await runLangGraphAgent(rawPrompt, {
+      conversationId: conversation.id,
       sceneContext,
-      metadata: { agentHistory, loopCount, progress: progress.steps },
+      model,
+      maxLoops: 10,
+      attachments,
     });
 
+    progress.merge("agent_execution", { 
+      message: "LangGraph agent completed", 
+      data: { loopCount: agentResult.loopCount, finished: agentResult.finished }
+    });
+
+    // Update analytics
+    analytics.totalGenerations += 1;
+    analytics.totalDurationMs += Date.now() - startedAt;
+    analytics.success += agentResult.finished ? 1 : 0;
+    analytics.errors += agentResult.finished ? 0 : 1;
+    analyticsRecorded = true;
+
+    // Handle screenshot if requested
+    let screenshot = null;
+    if (captureScreenshot && blenderAvailable) {
+      progress.add("screenshot", "Capturing viewport screenshot");
+      try {
+        screenshot = await sendCommandToBlender("capture_viewport", {});
+        progress.merge("screenshot", { message: "Screenshot captured" });
+      } catch (err) {
+        progress.addError("screenshot", "Failed to capture screenshot", err?.message || String(err));
+      }
+    }
+
+    // Save assistant message
+    await saveMessage(conversation.id, {
+      role: "assistant",
+      content: agentResult.response,
+      provider: model,
+      blenderResult: null, // LangGraph handles this internally
+      sceneContext: agentResult.sceneContext,
+      metadata: { 
+        agentHistory: agentResult.messages, 
+        loopCount: agentResult.loopCount, 
+        progress: progress.steps,
+        langGraph: true 
+      },
+    });
+
+    // Update conversation with scene context
     const updatedConversation = await touchConversation(conversation.id, {
-      sceneContext,
+      sceneContext: agentResult.sceneContext,
       title: (conversation.title === "New Scene" || !conversation.title) ? deriveTitleFromPrompt(rawPrompt) : undefined,
     });
 
+    // Get all messages for response
     const messages = await getConversationMessages(conversation.id);
 
     return {
-      response: finalAnswer,
-      blenderResult: lastBlenderResult,
+      response: agentResult.response,
+      blenderResult: null, // Handled internally by LangGraph
       provider: model,
       conversationId: conversation.id,
       conversationTitle: updatedConversation?.title || conversation.title,
-      sceneContext,
+      sceneContext: agentResult.sceneContext,
       messages,
       screenshot,
-      agentHistory,
-      loopCount,
+      agentHistory: agentResult.messages,
+      loopCount: agentResult.loopCount,
       progress: progress.steps,
-      debugArtifacts: debug ? { agentHistory, sceneContext } : undefined,
+      debugArtifacts: debug ? { agentHistory: agentResult.messages, sceneContext: agentResult.sceneContext } : undefined,
+      langGraph: true, // Flag to indicate LangGraph was used
     };
   } catch (err) {
-    console.error("❌ [Agent] FATAL ERROR in runGenerationCore:", err);
+    console.error("❌ [LangGraph Agent] FATAL ERROR in runGenerationCore:", err);
     if (!analyticsRecorded) {
       analytics.totalGenerations += 1;
       analytics.errors += 1;
@@ -964,10 +843,6 @@ async function runGenerationCore(body, user) {
     throw attachProgress(err instanceof Error ? err : new Error(String(err)));
   }
 }
-
-/* =========================
-   API endpoints (unchanged semantics)
-   ========================= */
 
 // Auth endpoints
 app.post("/api/auth/signup", async (req, res) => {
@@ -1248,9 +1123,10 @@ app.post("/api/generate", authenticate, async (req, res) => {
 // Models endpoint
 app.get("/api/models", authenticate, async (req, res) => {
   try {
+    const testKey = getRandomGeminiKey();
     res.json({
       models: [
-        genAI ? { id: "gemini", name: MODEL_CONFIGS.gemini.displayName } : null,
+        testKey ? { id: "gemini", name: MODEL_CONFIGS.gemini.displayName } : null,
         groqClient ? { id: "groq", name: MODEL_CONFIGS.groq.displayName } : null,
         cohereClient ? { id: "cohere", name: MODEL_CONFIGS.cohere.displayName } : null,
       ].filter(Boolean),
@@ -1288,8 +1164,9 @@ app.get("/api/models", authenticate, async (req, res) => {
       console.log(`🚀 Backend running at http://localhost:${PORT}`);
       
       // Log API configuration
-      if (genAI) console.log(`🤖 Gemini API: ✅ Configured`);
-      else console.log(`🤖 Gemini API: ❌ Not configured. Set GEMINI_API_KEY in .env to enable.`);
+      const testKey = getRandomGeminiKey();
+      if (testKey) console.log(`🤖 Gemini API: ✅ Configured with random key selection`);
+      else console.log(`🤖 Gemini API: ❌ Not configured. Set GEMINI_API_KEY_1, GEMINI_API_KEY_2, etc. in .env to enable.`);
       
       if (groqClient) console.log(`🚀 Groq API: ✅ Configured`);
       else console.log(`🚀 Groq API: ❌ Not configured. Set GROQ_API_KEY in .env to enable.`);

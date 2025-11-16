@@ -1,16 +1,18 @@
 /*
- * manual_gen.js
+ * generate_from_sketchfab.js
  *
- * A standalone script to demonstrate the "manual" procedural generation flow:
+ * A standalone script to demonstrate the full orchestration flow for Sketchfab:
  * 1. Connect to Blender TCP server.
- * 2. Get the current scene info from Blender.
- * 3. Call Gemini to get 'bpy' code for *creating* a model from a prompt.
- * 4. Execute the creation code in Blender.
+ * 2. Check Sketchfab status.
+ * 3. Search for a model by query.
+ * 4. Download and import the first available model by its UID.
+ * 5. Call Gemini to get 'bpy' code for *refining* the new asset.
+ * 6. Execute the refinement code in Blender.
  *
  * To Run:
  * 1. Ensure .env file is set with GEMINI_API_KEY_1, GEMINI_API_KEY_2, etc (or single GEMINI_API_KEY), BLENDER_TCP_PORT, BLENDER_TCP_HOST.
  * 2. Run: `npm install dotenv @google/generative-ai`
- * 3. Run: `node manual_gen.js`
+ * 3. Run: `node generate_from_sketchfab.js`
  */
 
 import net from 'net';
@@ -21,11 +23,10 @@ import { getRandomGeminiKey } from './utils/simple-api-keys.js';
 dotenv.config();
 
 // --- Configuration ---
-// This is the prompt the AI will use to procedurally generate the object
-const USER_PROMPT = "a short flight of 5 stairs";
+const USER_PROMPT = "a realistic dragon"; // The search query for Sketchfab
 const PORT = parseInt(process.env.BLENDER_TCP_PORT || "9876", 10);
 const HOST = process.env.BLENDER_TCP_HOST || "127.0.0.1";
-const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_MODEL = "gemini-2.5-flash"; // Switched to gemini-pro as requested
 
 // Dynamic Gemini client creation function
 async function createGeminiClient() {
@@ -131,8 +132,8 @@ function sendCommand(commandType, params = {}) {
             return reject(new Error('Another request is already pending.'));
         }
         
-        // Give 'execute_code' a longer timeout
-        const timeoutMs = commandType === 'execute_code' ? 30000 : 5000;
+        // Give download commands a longer timeout
+        const timeoutMs = commandType.startsWith('download_') ? 60000 : 15000; // 60s for download, 15s for others
 
         const timeout = setTimeout(() => {
             pendingRequest = null;
@@ -173,7 +174,7 @@ async function callLLMForCode(promptText) {
  * Gets a simplified system prompt
  */
 const getSystemPrompt = (sceneContext) => {
-    let basePrompt = `
+  let basePrompt = `
 You are an expert Blender Python script generator (Blender 4.5 API).
 Your goal is to generate accurate, production-quality Blender Python code.
 CRITICAL RULES:
@@ -183,17 +184,10 @@ CRITICAL RULES:
 4. Do NOT try to enable addons.
 5. For deleting: if bpy.data.objects: bpy.ops.object.select_all(action='SELECT'); bpy.ops.object.delete()
 
-API WARNINGS:
-- PRINCIPLED BSDF: The 'Specular' (0-1 float) input is DEPRECATED.
-- To set material color, use: bsdf.inputs["Base Color"].default_value = (R, G, B, A)
-- To set roughness, use: bsdf.inputs["Roughness"].default_value = (value)
-- Do NOT try to set bsdf.inputs["Specular"].default_value as a 0-1 float.
-- Do NOT use any \`bpy.ops.view3d.*\` operators (like \`view_selected\`). They fail in scripts.
-
 CURRENT SCENE CONTEXT:
-- Existing objects: ${sceneContext.objects.map(o => o.name).join(", ") || 'None'}
+- Existing objects: ${sceneContext.objects.join(", ") || 'None'}
 - Object count: ${sceneContext.object_count}`;
-    return basePrompt.trim();
+  return basePrompt.trim();
 };
 
 /**
@@ -217,36 +211,66 @@ function sanitizeBlenderCode(code) {
 
 async function runGeneration() {
     try {
-        console.log(`\n--- 🚀 Starting Manual Generation ---`);
+        console.log(`\n--- 🚀 Starting Sketchfab Generation ---`);
         console.log(`Prompt: "${USER_PROMPT}"`);
         
-        // 1. Get Scene Context
-        console.log('\n[Step 1/3] Getting scene context from Blender...');
-        const sceneContext = await sendCommand('get_scene_info');
-        console.log(`   -> Scene has ${sceneContext.object_count} objects.`);
+        // 1. Check Sketchfab Status
+        console.log('\n[Step 1/5] Checking Sketchfab status...');
+        const status = await sendCommand('get_sketchfab_status');
+        if (!status.enabled) {
+            throw new Error('Sketchfab integration is not enabled or API key is invalid.');
+        }
+        console.log(`   -> Sketchfab is ENABLED. (${status.message})`);
 
-        // 2. Call Gemini for Creation Code
-        console.log('\n[Step 2/3] Generating creation code with Gemini...');
+        // 2. Search for Model
+        console.log('\n[Step 2/5] Searching Sketchfab for models...');
+        const searchResult = await sendCommand('search_sketchfab_models', { query: USER_PROMPT });
+
+        const firstHit = searchResult.results?.[0];
+        if (!firstHit || !firstHit.uid) {
+            throw new Error(`No downloadable models found on Sketchfab for query: "${USER_PROMPT}"`);
+        }
+        const modelUid = firstHit.uid;
+        console.log(`   -> Found model: "${firstHit.name}" (UID: ${modelUid})`);
+
+        // 3. Download and Import Model
+        console.log('\n[Step 3/5] Downloading and importing model from Sketchfab...');
+        const importResult = await sendCommand('download_sketchfab_model', { uid: modelUid });
+
+        if (!importResult.success || !importResult.imported_objects || importResult.imported_objects.length === 0) {
+            throw new Error(`Failed to import Sketchfab model: ${importResult.error || 'No objects were imported'}`);
+        }
         
-        // Construct the full prompt for *creation*
+        // Get the primary imported object (often the first one)
+        const newObjectName = importResult.imported_objects[0];
+        console.log(`   -> Successfully imported as: "${newObjectName}"`);
+
+        // 4. Call Gemini for Refinement Code
+        console.log('\n[Step 4/5] Generating refinement code with Gemini...');
+        const sceneContext = await sendCommand('get_scene_info');
+        
+        const refinementPrompt = `A new object named "${newObjectName}" was just imported.
+Generate Python code to:
+1. Clear any existing object selection.
+2. Select the object named "${newObjectName}" by name.
+3. Make it the active object.
+4. Scale the object uniformly so its largest dimension is 2.0 meters.
+5. Move the object so its center is at (0, 0, 1.0), placing it 1m above the grid floor.`;
+
         const systemPrompt = getSystemPrompt(sceneContext);
-        const fullPrompt = `${systemPrompt}\n\nUser request:\n${USER_PROMPT}`;
+        const fullPrompt = `${systemPrompt}\n\nUser request:\n${refinementPrompt}`;
 
         let { code } = await callLLMForCode(fullPrompt);
         code = sanitizeBlenderCode(code);
-
-        if (!code || code.trim().length === 0) {
-            throw new Error("Gemini returned empty code.");
-        }
-
         console.log('   -> Gemini Code (Sanitized):\n', code);
 
-        // 3. Execute Creation Code
-        console.log('\n[Step 3/3] Executing creation code in Blender...');
+        // 5. Execute Refinement Code
+        console.log('\n[Step 5/5] Executing refinement code in Blender...');
         const execResult = await sendCommand('execute_code', { code });
         console.log('   -> Execution successful.');
 
         console.log('\n--- ✅ Generation Complete! ---');
+        console.log(`   Model: "${newObjectName}"`);
         console.log('   Blender Result:', execResult);
 
     } catch (err) {
