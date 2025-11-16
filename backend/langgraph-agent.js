@@ -5,7 +5,6 @@ import { tool } from "@langchain/core/tools";
 import { z } from "zod";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import Groq from "groq-sdk";
-import { CohereClient } from "cohere-ai";
 import pgvector from "pgvector/pg";
 import { pipeline } from "@xenova/transformers";
 import { getRandomGeminiKey } from './utils/simple-api-keys.js';
@@ -14,7 +13,6 @@ import { pool } from "./db.js";
 
 // Initialize AI providers (reuse from server.js)
 const groqClient = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
-const cohereClient = process.env.COHERE_API_KEY ? new CohereClient({ token: process.env.COHERE_API_KEY }) : null;
 
 // Dynamic Gemini client creation function
 async function createGeminiClient() {
@@ -26,10 +24,7 @@ async function createGeminiClient() {
 const MODEL_CONFIGS = {
   gemini: { name: "gemini-2.5-flash", displayName: "Gemini 2.5 Flash" },
   groq: { name: "llama-3.3-70b-versatile", displayName: "Llama 3.3 70B (Groq)" },
-  cohere: { name: "command-r-plus", displayName: "Command R+ (Cohere)" },
 };
-
-// RAG / embeddings (reuse from server.js)
 const EMBEDDING_MODEL_NAME = "Xenova/all-MiniLM-L6-v2";
 const EXPECTED_EMBEDDING_DIM = 380;
 
@@ -777,22 +772,6 @@ async function callAgentLLM(messages, model = "gemini") {
         temperature: 0.3,
       });
       response = groqResponse.choices[0].message.content;
-      break;
-    }
-    case "cohere": {
-      if (!cohereClient) throw new Error("Cohere API not configured");
-      const cohereMessages = messages.map(msg => ({
-        role: msg instanceof HumanMessage ? "USER" : "CHATBOT",
-        message: msg.content,
-      }));
-      const lastMessage = cohereMessages.pop();
-      const cohereResponse = await cohereClient.chat({
-        model: MODEL_CONFIGS.cohere.name,
-        chatHistory: cohereMessages,
-        message: lastMessage.message,
-        temperature: 0.3,
-      });
-      response = cohereResponse.text;
       break;
     }
     default:

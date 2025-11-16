@@ -9,7 +9,7 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import Groq from "groq-sdk";
-import { CohereClient } from "cohere-ai";
+
 import { pipeline } from "@xenova/transformers";
 import pgvector from "pgvector/pg";
 
@@ -42,7 +42,6 @@ if (!JWT_SECRET) {
 
 // Initialize AI providers (may be null if key missing)
 const groqClient = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
-const cohereClient = process.env.COHERE_API_KEY ? new CohereClient({ token: process.env.COHERE_API_KEY }) : null;
 
 // Dynamic Gemini client creation function
 async function createGeminiClient() {
@@ -54,7 +53,6 @@ async function createGeminiClient() {
 const MODEL_CONFIGS = {
   gemini: { name: "gemini-2.5-flash", displayName: "Gemini 2.5 Flash" },
   groq: { name: "llama-3.3-70b-versatile", displayName: "Llama 3.3 70B (Groq)" },
-  cohere: { name: "command-r-plus", displayName: "Command R+ (Cohere)" },
 };
 const PROMPT_ENHANCER_MODEL = "llama-3.1-8b-instant";
 
@@ -188,7 +186,7 @@ Example:
   return prompt;
 }
 
-// LLM caller for agent (supports gemini/groq/cohere)
+// LLM caller for agent (supports gemini/groq)
 async function callAgentLLM(systemPrompt, agentHistory, model = "gemini") {
   let rawResponseText = "";
 
@@ -224,20 +222,6 @@ async function callAgentLLM(systemPrompt, agentHistory, model = "gemini") {
         temperature: 0.3,
       });
       rawResponseText = response.choices[0].message.content;
-      break;
-    }
-    case "cohere": {
-      if (!cohereClient) throw new Error("Cohere API not configured");
-      const cohereHistory = agentHistory.map(h => ({ role: h.role === "assistant" ? "CHATBOT" : "USER", message: h.parts[0].text }));
-      const lastMessage = cohereHistory.pop();
-      const response = await cohereClient.chat({
-        model: MODEL_CONFIGS.cohere.name,
-        system: systemPrompt,
-        chatHistory: cohereHistory,
-        message: lastMessage.message,
-        temperature: 0.3,
-      });
-      rawResponseText = response.text;
       break;
     }
     default:
@@ -1128,7 +1112,6 @@ app.get("/api/models", authenticate, async (req, res) => {
       models: [
         testKey ? { id: "gemini", name: MODEL_CONFIGS.gemini.displayName } : null,
         groqClient ? { id: "groq", name: MODEL_CONFIGS.groq.displayName } : null,
-        cohereClient ? { id: "cohere", name: MODEL_CONFIGS.cohere.displayName } : null,
       ].filter(Boolean),
       defaults: { agent: "gemini" },
       promptEnhancer: groqClient ? PROMPT_ENHANCER_MODEL : null,
@@ -1170,9 +1153,6 @@ app.get("/api/models", authenticate, async (req, res) => {
       
       if (groqClient) console.log(`🚀 Groq API: ✅ Configured`);
       else console.log(`🚀 Groq API: ❌ Not configured. Set GROQ_API_KEY in .env to enable.`);
-      
-      if (cohereClient) console.log(`🕊️ Cohere API: ✅ Configured`);
-      else console.log(`🕊️ Cohere API: ❌ Not configured. Set COHERE_API_KEY in .env to enable.`);
       
       console.log(`📚 RAG Model: ${EMBEDDING_MODEL_NAME}`);
     });

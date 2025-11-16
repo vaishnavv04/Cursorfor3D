@@ -111,7 +111,6 @@ The agent follows a structured workflow:
 Supports multiple LLM providers:
 - **Gemini 2.5 Flash**: Primary model for reasoning
 - **Groq Llama 3.3 70B**: Alternative high-performance option
-- **Cohere Command R+**: Additional model choice
 
 ## Migration Benefits
 
@@ -182,7 +181,6 @@ No additional environment variables are required. The LangGraph implementation u
 
 - `GEMINI_API_KEY`: For Gemini model access
 - `GROQ_API_KEY`: For Groq model access
-- `COHERE_API_KEY`: For Cohere model access
 - `DATABASE_URL`: PostgreSQL connection with pgvector
 
 ### Dependencies
