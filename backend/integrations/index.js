@@ -12,6 +12,7 @@ import net from 'net';
 import * as hyper3d from './hyper3d.js';
 import * as sketchfab from './sketchfab.js';
 import * as polyhaven from './polyhaven.js';
+import { createCircuitBreaker } from './circuit-breaker.js';
 
 // Default TCP connection settings
 const PORT = parseInt(process.env.BLENDER_TCP_PORT || "9876", 10);
@@ -25,7 +26,12 @@ let isConnected = false;
 // Queue for managing multiple TCP commands
 let commandQueue = [];
 let isProcessingQueue = false;
-let pendingRequest = null; 
+let pendingRequest = null;
+
+// Circuit breakers for each integration type
+const hyper3dCircuitBreaker = createCircuitBreaker({ threshold: 3, timeout: 30000 });
+const sketchfabCircuitBreaker = createCircuitBreaker({ threshold: 3, timeout: 30000 });
+const polyhavenCircuitBreaker = createCircuitBreaker({ threshold: 3, timeout: 30000 }); 
 
 /**
  * Initialize the TCP connection to Blender
@@ -352,21 +358,31 @@ export const integrationModules = {
   
   // Integration-specific modules
   // We call the imported functions and pass them our 'sendCommand'
+  // Each is wrapped with circuit breaker protection
   hyper3d: {
-    generateAndImportAsset: (prompt, progress) => {
-      return hyper3d.generateAndImportAsset(sendCommand, prompt, progress);
-    }
+    generateAndImportAsset: async (prompt, progress) => {
+      return hyper3dCircuitBreaker.execute(() => {
+        return hyper3d.generateAndImportAsset(sendCommand, prompt, progress);
+      });
+    },
+    getCircuitBreakerState: () => hyper3dCircuitBreaker.getState(),
   },
-  
+
   sketchfab: {
-    searchAndImportModel: (query) => {
-      return sketchfab.searchAndImportModel(sendCommand, query);
-    }
+    searchAndImportModel: async (query) => {
+      return sketchfabCircuitBreaker.execute(() => {
+        return sketchfab.searchAndImportModel(sendCommand, query);
+      });
+    },
+    getCircuitBreakerState: () => sketchfabCircuitBreaker.getState(),
   },
-  
+
   polyhaven: {
-    searchAndImportAsset: (query, assetType = "models") => {
-      return polyhaven.searchAndImportAsset(sendCommand, query, assetType);
-    }
+    searchAndImportAsset: async (query, assetType = "models") => {
+      return polyhavenCircuitBreaker.execute(() => {
+        return polyhaven.searchAndImportAsset(sendCommand, query, assetType);
+      });
+    },
+    getCircuitBreakerState: () => polyhavenCircuitBreaker.getState(),
   }
 };

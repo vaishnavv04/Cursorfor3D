@@ -18,6 +18,7 @@ import { createProgressTracker } from "./utils/progress.js";
 import { getRandomGeminiKey } from "./utils/simple-api-keys.js";
 import { integrationModules, initBlenderConnection, sendCommand, isBlenderConnected } from './integrations/index.js';
 import { runLangGraphAgent } from "./langgraph-agent.js";
+import { apiLimiter, authLimiter, generationLimiter } from "./middleware/security.js";
 import path from "node:path";
 import os from "node:os";
 
@@ -29,6 +30,9 @@ const cryptoModule = await import("node:crypto");
 const app = express();
 app.use(cors());
 app.use(bodyParser.json({ limit: "50mb" }));
+
+// Apply general API rate limiting to all routes
+app.use("/api/", apiLimiter);
 
 const PORT = process.env.PORT || 5000;
 const BLENDER_TCP_PORT = parseInt(process.env.BLENDER_TCP_PORT || "9876", 10);
@@ -829,7 +833,7 @@ async function runGenerationCore(body, user) {
 }
 
 // Auth endpoints
-app.post("/api/auth/signup", async (req, res) => {
+app.post("/api/auth/signup", authLimiter, async (req, res) => {
   try {
     const { email, password, displayName } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: "Email and password are required" });
@@ -846,7 +850,7 @@ app.post("/api/auth/signup", async (req, res) => {
   }
 });
 
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: "Email and password are required" });
@@ -986,6 +990,96 @@ app.post("/api/feedback", authenticate, async (req, res) => {
   }
 });
 
+// API Key Validation endpoint
+app.post("/api/validate-key", authenticate, async (req, res) => {
+  const { service, apiKey } = req.body;
+  
+  if (!service || !apiKey) {
+    return res.status(400).json({ valid: false, error: "Service and apiKey are required" });
+  }
+  
+  try {
+    let isValid = false;
+    let errorMessage = null;
+    
+    switch (service.toLowerCase()) {
+      case 'gemini':
+        try {
+          const testGenAI = new GoogleGenerativeAI(apiKey);
+          const model = testGenAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+          await model.generateContent({ contents: [{ role: "user", parts: [{ text: "test" }] }] });
+          isValid = true;
+        } catch (error) {
+          errorMessage = error.message;
+        }
+        break;
+        
+      case 'groq':
+        try {
+          const testGroq = new Groq({ apiKey });
+          await testGroq.chat.completions.create({
+            model: "llama-3.3-70b-versatile",
+            messages: [{ role: "user", content: "test" }],
+            max_tokens: 5
+          });
+          isValid = true;
+        } catch (error) {
+          errorMessage = error.message;
+        }
+        break;
+        
+      case 'hyper3d':
+      case 'rodin':
+        try {
+          const response = await fetch('https://hyperhuman.deemos.com/api/v2/status', {
+            headers: {
+              'Authorization': `Bearer ${apiKey}`,
+              'Content-Type': 'application/json'
+            }
+          });
+          isValid = response.ok;
+          if (!isValid) {
+            errorMessage = `HTTP ${response.status}: ${response.statusText}`;
+          }
+        } catch (error) {
+          errorMessage = error.message;
+        }
+        break;
+        
+      case 'sketchfab':
+        try {
+          const response = await fetch('https://api.sketchfab.com/v3/me', {
+            headers: {
+              'Authorization': `Token ${apiKey}`
+            }
+          });
+          isValid = response.ok;
+          if (!isValid) {
+            errorMessage = `HTTP ${response.status}: ${response.statusText}`;
+          }
+        } catch (error) {
+          errorMessage = error.message;
+        }
+        break;
+        
+      default:
+        return res.status(400).json({ 
+          valid: false, 
+          error: `Unknown service: ${service}. Supported: gemini, groq, hyper3d, sketchfab` 
+        });
+    }
+    
+    res.json({ 
+      valid: isValid,
+      service,
+      ...(errorMessage && { error: errorMessage })
+    });
+  } catch (error) {
+    console.error(`❌ API key validation error for ${service}:`, error.message);
+    res.status(500).json({ valid: false, error: "Validation failed: " + error.message });
+  }
+});
+
 // Scene info
 app.post("/api/scene-info", authenticate, async (req, res) => {
   const rl = checkRateLimit(req.user.id);
@@ -1088,7 +1182,7 @@ app.get("/api/jobs/:id/status", authenticate, async (req, res) => {
 });
 
 // Generate endpoint (agent)
-app.post("/api/generate", authenticate, async (req, res) => {
+app.post("/api/generate", authenticate, generationLimiter, async (req, res) => {
   try {
     const rl = checkRateLimit(req.user.id);
     if (!rl.ok) {

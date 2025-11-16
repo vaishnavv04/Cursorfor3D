@@ -18,10 +18,13 @@ if (!connectionString) {
 const isSupabase = /supabase/i.test(connectionString);
 const pool = new Pool({
   connectionString,
-  ssl: isSupabase ? { rejectUnauthorized: false } : undefined,
-  connectionTimeoutMillis: 10000, // 10 second timeout
-  idleTimeoutMillis: 30000,
-  max: 20,
+  max: 20, // maximum pool size
+  idleTimeoutMillis: 30000, // close idle clients after 30 seconds
+  connectionTimeoutMillis: 2000, // return an error after 2 seconds if connection could not be established
+  // Add SSL for production
+  ssl: process.env.NODE_ENV === 'production' || isSupabase 
+    ? { rejectUnauthorized: false } 
+    : false,
 });
 
 // --- FIX: Prevents unhandled errors on idle clients from crashing the app ---
@@ -203,4 +206,20 @@ async function initSchema() {
   }
 }
 
-export { pool, initSchema, mapConversation, mapMessage };
+/**
+ * Database health check function
+ * @returns {Promise<boolean>} True if database is healthy, false otherwise
+ */
+async function checkDatabaseHealth() {
+  try {
+    const client = await pool.connect();
+    await client.query('SELECT NOW()');
+    client.release();
+    return true;
+  } catch (err) {
+    console.error('Database health check failed:', err);
+    return false;
+  }
+}
+
+export { pool, initSchema, mapConversation, mapMessage, checkDatabaseHealth };

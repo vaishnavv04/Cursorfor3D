@@ -19,7 +19,7 @@ from contextlib import redirect_stdout, suppress
 bl_info = {
     "name": "Blender MCP",
     "author": "BlenderMCP",
-    "version": (1, 2),
+    "version": (1, 3),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > BlenderMCP",
     "description": "Connect Blender to Claude via MCP",
@@ -27,6 +27,51 @@ bl_info = {
 }
 
 RODIN_FREE_TRIAL_KEY = "k9TcfFoEhNd9cCPP2guHAHHHkctZHIRhZDywZ1euGUXwihbYLpOjQhofby80NJez"
+
+# Secure API Key Storage (Session-only, not saved in .blend files)
+class SecureAPIKeyStorage:
+    """Secure storage for API keys - session only, not persisted in .blend files"""
+    _session_keys = {}
+    
+    @classmethod
+    def set_key(cls, service, key):
+        """Store API key in memory for current session only"""
+        if key:
+            cls._session_keys[service] = key
+            print(f"🔐 Stored {service} API key securely (session-only)")
+        elif service in cls._session_keys:
+            del cls._session_keys[service]
+    
+    @classmethod
+    def get_key(cls, service):
+        """Retrieve API key from session storage"""
+        return cls._session_keys.get(service, "")
+    
+    @classmethod
+    def has_key(cls, service):
+        """Check if API key exists for service"""
+        return service in cls._session_keys and bool(cls._session_keys[service])
+    
+    @classmethod
+    def clear_all(cls):
+        """Clear all session keys"""
+        cls._session_keys.clear()
+        print("🔐 All API keys cleared from session")
+    
+    @classmethod
+    def mask_key(cls, key):
+        """Mask API key for logging"""
+        if not key or len(key) < 8:
+            return "****"
+        return f"{key[:4]}****{key[-4:]}"
+
+def get_api_key(service):
+    """Get API key from secure storage"""
+    key = SecureAPIKeyStorage.get_key(service)
+    if key:
+        return key
+    # Return empty string instead of None for backward compatibility
+    return ""
 
 # Add User-Agent as required by Poly Haven API
 REQ_HEADERS = requests.utils.default_headers()
@@ -1112,7 +1157,8 @@ class BlenderMCPServer:
         """Get the current status of Hyper3D Rodin integration"""
         enabled = bpy.context.scene.blendermcp_use_hyper3d
         if enabled:
-            if not bpy.context.scene.blendermcp_hyper3d_api_key:
+            api_key = get_api_key('hyper3d')
+            if not api_key:
                 return {
                     "enabled": False,
                     "message": """Hyper3D Rodin integration is currently enabled, but API key is not given. To enable it:
@@ -1123,7 +1169,7 @@ class BlenderMCPServer:
                 }
             mode = bpy.context.scene.blendermcp_hyper3d_mode
             message = f"Hyper3D Rodin integration is enabled and ready to use. Mode: {mode}. " + \
-                f"Key type: {'private' if bpy.context.scene.blendermcp_hyper3d_api_key != RODIN_FREE_TRIAL_KEY else 'free_trial'}"
+                f"Key: {SecureAPIKeyStorage.mask_key(api_key)} ({'private' if api_key != RODIN_FREE_TRIAL_KEY else 'free_trial'})"
             return {
                 "enabled": True,
                 "message": message
@@ -1168,7 +1214,7 @@ class BlenderMCPServer:
             response = requests.post(
                 "https://hyperhuman.deemos.com/api/v2/rodin",
                 headers={
-                    "Authorization": f"Bearer {bpy.context.scene.blendermcp_hyper3d_api_key}",
+                    "Authorization": f"Bearer {get_api_key('hyper3d')}",
                 },
                 files=files
             )
@@ -1196,7 +1242,7 @@ class BlenderMCPServer:
             response = requests.post(
                 "https://queue.fal.run/fal-ai/hyper3d/rodin",
                 headers={
-                    "Authorization": f"Key {bpy.context.scene.blendermcp_hyper3d_api_key}",
+                    "Authorization": f"Key {get_api_key('hyper3d')}",
                     "Content-Type": "application/json",
                 },
                 json=req_data
@@ -1220,7 +1266,7 @@ class BlenderMCPServer:
         response = requests.post(
             "https://hyperhuman.deemos.com/api/v2/status",
             headers={
-                "Authorization": f"Bearer {bpy.context.scene.blendermcp_hyper3d_api_key}",
+                "Authorization": f"Bearer {get_api_key('hyper3d')}",
             },
             json={
                 "subscription_key": subscription_key,
@@ -1236,7 +1282,7 @@ class BlenderMCPServer:
         response = requests.get(
             f"https://queue.fal.run/fal-ai/hyper3d/requests/{request_id}/status",
             headers={
-                "Authorization": f"KEY {bpy.context.scene.blendermcp_hyper3d_api_key}",
+                "Authorization": f"KEY {get_api_key('hyper3d')}",
             },
         )
         data = response.json()
@@ -1323,7 +1369,7 @@ class BlenderMCPServer:
         response = requests.post(
             "https://hyperhuman.deemos.com/api/v2/download",
             headers={
-                "Authorization": f"Bearer {bpy.context.scene.blendermcp_hyper3d_api_key}",
+                "Authorization": f"Bearer {get_api_key('hyper3d')}",
             },
             json={
                 'task_uuid': task_uuid
@@ -1389,7 +1435,7 @@ class BlenderMCPServer:
         response = requests.get(
             f"https://queue.fal.run/fal-ai/hyper3d/requests/{request_id}",
             headers={
-                "Authorization": f"Key {bpy.context.scene.blendermcp_hyper3d_api_key}",
+                "Authorization": f"Key {get_api_key('hyper3d')}",
             }
         )
         data_ = response.json()
@@ -1447,7 +1493,7 @@ class BlenderMCPServer:
     def get_sketchfab_status(self):
         """Get the current status of Sketchfab integration"""
         enabled = bpy.context.scene.blendermcp_use_sketchfab
-        api_key = bpy.context.scene.blendermcp_sketchfab_api_key
+        api_key = get_api_key('sketchfab')
 
         # Test the API key if present
         if api_key:
@@ -1509,7 +1555,7 @@ class BlenderMCPServer:
     def search_sketchfab_models(self, query, categories=None, count=20, downloadable=True):
         """Search for models on Sketchfab based on query and optional filters"""
         try:
-            api_key = bpy.context.scene.blendermcp_sketchfab_api_key
+            api_key = get_api_key('sketchfab')
             if not api_key:
                 return {"error": "Sketchfab API key is not configured"}
 
@@ -1571,7 +1617,7 @@ class BlenderMCPServer:
     def download_sketchfab_model(self, uid):
         """Download a model from Sketchfab by its UID"""
         try:
-            api_key = bpy.context.scene.blendermcp_sketchfab_api_key
+            api_key = get_api_key('sketchfab')
             if not api_key:
                 return {"error": "Sketchfab API key is not configured"}
 
@@ -1707,12 +1753,22 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
         layout.prop(scene, "blendermcp_use_hyper3d", text="Use Hyper3D Rodin 3D model generation")
         if scene.blendermcp_use_hyper3d:
             layout.prop(scene, "blendermcp_hyper3d_mode", text="Rodin Mode")
-            layout.prop(scene, "blendermcp_hyper3d_api_key", text="API Key")
+            # Show API key status
+            hyper3d_key = SecureAPIKeyStorage.get_key('hyper3d')
+            if hyper3d_key:
+                layout.label(text=f"API Key: {SecureAPIKeyStorage.mask_key(hyper3d_key)} 🔒", icon='LOCKED')
+            else:
+                layout.label(text="API Key: Not set ❌", icon='UNLOCKED')
             layout.operator("blendermcp.set_hyper3d_free_trial_api_key", text="Set Free Trial API Key")
 
         layout.prop(scene, "blendermcp_use_sketchfab", text="Use assets from Sketchfab")
         if scene.blendermcp_use_sketchfab:
-            layout.prop(scene, "blendermcp_sketchfab_api_key", text="API Key")
+            # Show API key status
+            sketchfab_key = SecureAPIKeyStorage.get_key('sketchfab')
+            if sketchfab_key:
+                layout.label(text=f"API Key: {SecureAPIKeyStorage.mask_key(sketchfab_key)} 🔒", icon='LOCKED')
+            else:
+                layout.label(text="API Key: Not set ❌", icon='UNLOCKED')
 
         if not scene.blendermcp_server_running:
             layout.operator("blendermcp.start_server", text="Connect to MCP server")
@@ -1726,9 +1782,9 @@ class BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey(bpy.types.Operator):
     bl_label = "Set Free Trial API Key"
 
     def execute(self, context):
-        context.scene.blendermcp_hyper3d_api_key = RODIN_FREE_TRIAL_KEY
+        SecureAPIKeyStorage.set_key('hyper3d', RODIN_FREE_TRIAL_KEY)
         context.scene.blendermcp_hyper3d_mode = 'MAIN_SITE'
-        self.report({'INFO'}, "API Key set successfully!")
+        self.report({'INFO'}, "Free trial API Key set successfully!")
         return {'FINISHED'}
 
 # Operator to start the server
@@ -1805,24 +1861,10 @@ def register():
         default="MAIN_SITE"
     )
 
-    bpy.types.Scene.blendermcp_hyper3d_api_key = bpy.props.StringProperty(
-        name="Hyper3D API Key",
-        subtype="PASSWORD",
-        description="API Key provided by Hyper3D",
-        default=""
-    )
-
     bpy.types.Scene.blendermcp_use_sketchfab = bpy.props.BoolProperty(
         name="Use Sketchfab",
         description="Enable Sketchfab asset integration",
         default=False
-    )
-
-    bpy.types.Scene.blendermcp_sketchfab_api_key = bpy.props.StringProperty(
-        name="Sketchfab API Key",
-        subtype="PASSWORD",
-        description="API Key provided by Sketchfab",
-        default=""
     )
 
     bpy.utils.register_class(BLENDERMCP_PT_Panel)
@@ -1843,14 +1885,15 @@ def unregister():
     bpy.utils.unregister_class(BLENDERMCP_OT_StartServer)
     bpy.utils.unregister_class(BLENDERMCP_OT_StopServer)
 
+    # Clear secure API keys from memory
+    SecureAPIKeyStorage.clear_all()
+
     del bpy.types.Scene.blendermcp_port
     del bpy.types.Scene.blendermcp_server_running
     del bpy.types.Scene.blendermcp_use_polyhaven
     del bpy.types.Scene.blendermcp_use_hyper3d
     del bpy.types.Scene.blendermcp_hyper3d_mode
-    del bpy.types.Scene.blendermcp_hyper3d_api_key
     del bpy.types.Scene.blendermcp_use_sketchfab
-    del bpy.types.Scene.blendermcp_sketchfab_api_key
 
     print("BlenderMCP addon unregistered")
 

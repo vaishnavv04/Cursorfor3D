@@ -124,3 +124,7 @@ venv/
 env/
 ENV/
 venv-mcp/
+
+# AI agent instructions (generated, not source)
+.github/copilot-instructions.md
+.github

@@ -17,22 +17,28 @@ CursorFor3D revolutionizes 3D content creation by combining the power of AI with
 ### 🎯 Smart Features
 - **Intelligent Prompt Enhancement**: Groq-powered llama-3.1-8b-instant model enhances prompts for better results
 - **Context-Aware Modeling**: Maintains scene context and spatial relationships across conversations
-- **Automatic Error Recovery**: Multi-agent system for automatic error detection and code repair
+- **ReAct Agent System**: Advanced reasoning loop with tool selection and execution
+- **Automatic Error Recovery**: Self-healing code generation with retry mechanisms
 - **Real-Time Progress Tracking**: Structured timeline events with detailed generation steps
 - **Visual Refinement**: Optional viewport screenshot analysis for iterative improvements
 - **RAG-Powered Knowledge Base**: Vector embeddings of Blender 4.5 Python API documentation for context-aware code generation
 - **Smart Integration Orchestration**: Automatic selection of optimal generation method based on prompt analysis
+- **Robust Connection Handling**: Automatic reconnection and error recovery for Blender TCP communication
 
 ### 💻 Technical Architecture
-- **Blender MCP Integration**: Direct TCP communication with Blender's Model Context Protocol (port 9876)
-- **Dual-LLM System**: 
-  - **Google Gemini 2.5 Flash**: Primary model for Blender code generation, scene understanding, and error recovery
+- **Blender TCP Integration**: Direct socket communication with Blender addon on port 9876
+- **ReAct Agent Framework**: Reason-Act-Observe loop for intelligent task execution
+- **Multi-LLM Support**: 
+  - **Google Gemini 2.5 Flash**: Primary model for Blender code generation and reasoning
+  - **Groq llama-3.3-70b**: Alternative model for code generation and agent tasks
+  - **Cohere Command R+**: Additional model option for diverse generation strategies
   - **Groq llama-3.1-8b-instant**: Fast prompt enhancement for improved generation quality
 - **Modern Frontend**: Electron + React with Tailwind CSS for responsive UI
-- **Backend API**: Node.js/Express server with PostgreSQL for data persistence
-- **Smart Caching**: LRU cache reduces redundant API calls for similar prompts
+- **Backend API**: Node.js/Express server with PostgreSQL and pgvector for data persistence
+- **Smart Caching**: LRU cache with configurable TTL reduces redundant API calls
 - **Vector Database**: pgvector extension for semantic search of Blender API documentation
-- **RAG System**: Retrieval-Augmented Generation using Xenova transformers for context-aware code generation
+- **RAG System**: Retrieval-Augmented Generation using Xenova/all-MiniLM-L6-v2 for context-aware code generation
+- **Robust Socket Management**: Automatic reconnection, queue management, and error recovery for TCP communication
 
 ## 🚀 Quick Start
 
@@ -308,6 +314,14 @@ CursorFor3D/
 
 ## 🛠️ Technical Details
 
+### ReAct Agent System
+The system uses a sophisticated Reason-Act-Observe loop for task execution:
+- **Reasoning**: Agent analyzes user request and formulates a plan
+- **Tool Selection**: Chooses from available tools (search_knowledge_base, execute_blender_code, get_scene_info, asset_search_and_import, finish_task)
+- **Execution**: Executes selected tool and observes results
+- **Iteration**: Continues loop until task is complete (max 10 loops)
+- **Error Recovery**: Automatically retries with fixes when code execution fails
+
 ### Blender Code Generation
 The system generates Blender 4.5-compatible Python code with strict validation:
 - Automatic import of `bpy` module
@@ -317,6 +331,7 @@ The system generates Blender 4.5-compatible Python code with strict validation:
 - Error-specific hints for common issues
 - **RAG-Enhanced Generation**: Uses vector embeddings of Blender API documentation for context-aware code suggestions
 - **Semantic Search**: Retrieves relevant API documentation based on prompt context using pgvector similarity search
+- **Code Sanitization**: Automatic cleanup and validation before execution
 
 ### Smart Caching
 - **LRU Cache**: Stores generated code with SHA-256 hash keys
@@ -410,11 +425,13 @@ We welcome contributions! Here's how you can help:
 ### Common Issues
 
 #### Backend Connection Issues
-- **"Blender MCP not connected"**
-  - Ensure Blender is running with MCP add-on enabled
-  - Check that MCP is listening on port 9876
+- **"Blender is not connected"** or **"Socket is closed"**
+  - Ensure Blender is running with TCP server addon enabled
+  - Check that the addon is listening on port 9876
   - Verify `BLENDER_TCP_HOST` and `BLENDER_TCP_PORT` in `.env`
-  - Check backend console for connection status
+  - Backend automatically retries connection every 5 seconds
+  - Check backend console for "✅ Connected to Blender TCP server" message
+  - If connection drops during operation, backend will attempt automatic reconnection
 
 #### API Key Errors
 - **Gemini API errors**
@@ -449,13 +466,17 @@ We welcome contributions! Here's how you can help:
 #### Generation Failures
 - **"Timeout: No response for [command]"**
   - Long-running operations (Hyper3D, downloads) have 60s timeout
+  - Standard operations timeout after 15s
   - Check Blender console for errors
   - Verify internet connection for API calls
+  - Backend will discard late responses from timed-out requests
 
 - **Blender execution errors**
   - Check that objects are selected when required
   - Ensure correct mode (OBJECT vs EDIT)
-  - System automatically retries with fixes up to 2 times
+  - ReAct agent automatically analyzes errors and retries with fixes
+  - Agent can make up to 10 reasoning loops to complete the task
+  - Check progress tracking for detailed step-by-step information
 
 #### Frontend Issues
 - **Electron window blank**
@@ -532,17 +553,21 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [ ] Real-time collaboration features
 - [ ] Version control for scene iterations
 
-### In Progress
+### Completed Features
+- [x] ReAct agent system with intelligent tool selection
 - [x] Hyper3D integration for realistic models
 - [x] PolyHaven asset integration
 - [x] Sketchfab model search and import
-- [x] Error recovery system
-- [x] Progress tracking
-- [x] Prompt enhancement
+- [x] Multi-LLM support (Gemini, Groq, Cohere)
+- [x] Robust socket connection handling with auto-reconnect
+- [x] Error recovery system with automatic retries
+- [x] Progress tracking with detailed timeline
+- [x] Prompt enhancement via Groq
 - [x] RAG-powered knowledge base with Blender API documentation
 - [x] Vector database integration with pgvector
 - [x] Smart integration orchestration system
 - [x] Semantic search for API documentation
+- [x] Request queue management and timeout handling
 
 ---
 

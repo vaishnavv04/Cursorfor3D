@@ -61,46 +61,76 @@ async function tableExists(tableName) {
   }
 }
 
+// Helper function for Levenshtein distance calculation
+function levenshteinDistance(str1, str2) {
+  const matrix = Array(str2.length + 1).fill(null).map(() => Array(str1.length + 1).fill(0));
+  for (let i = 0; i <= str1.length; i++) matrix[0][i] = i;
+  for (let j = 0; j <= str2.length; j++) matrix[j][0] = j;
+  
+  for (let j = 1; j <= str2.length; j++) {
+    for (let i = 1; i <= str1.length; i++) {
+      const cost = str1[i - 1] === str2[j - 1] ? 0 : 1;
+      matrix[j][i] = Math.min(
+        matrix[j][i - 1] + 1,
+        matrix[j - 1][i] + 1,
+        matrix[j - 1][i - 1] + cost
+      );
+    }
+  }
+  return matrix[str2.length][str1.length];
+}
+
+// Helper function for string similarity calculation
+function similarity(str1, str2) {
+  const len1 = str1.length;
+  const len2 = str2.length;
+  const maxLen = Math.max(len1, len2);
+  if (maxLen === 0) return 1.0;
+  const distance = levenshteinDistance(str1, str2);
+  return 1 - distance / maxLen;
+}
+
+// Helper function to deduplicate search results
+function deduplicateResults(rows, similarityThreshold = 0.95) {
+  const unique = [];
+  for (const row of rows) {
+    const isDuplicate = unique.some(existing => 
+      similarity(existing.content, row.content) > similarityThreshold
+    );
+    if (!isDuplicate) {
+      unique.push(row);
+    }
+  }
+  return unique;
+}
+
 async function searchKnowledgeBase(queryText, limit = 5) {
   console.log(`🔍 [RAG] Searching knowledge base for: "${String(queryText).slice(0, 100)}..."`);
   try {
     const queryEmbedding = await embedQuery(queryText);
     const vectorString = pgvector.toSql(queryEmbedding);
     
-    // Check if we have the new table available
+    const MIN_SIMILARITY = 0.3; // Add threshold for better quality results
     const hasNewTable = await tableExists("blender_knowledge_new");
     
-    // Try the new table first if it exists
-    if (hasNewTable) {
-      try {
-        const newTableQuery = `
-          SELECT content, 1 - (embedding <=> $1) AS similarity
-          FROM blender_knowledge_new
-          WHERE 1 - (embedding <=> $1) > 0.2
-          ORDER BY similarity DESC
-          LIMIT $2
-        `;
-        const { rows: newRows } = await pool.query(newTableQuery, [vectorString, limit]);
-        if (newRows && newRows.length > 0) {
-          console.log(`✅ [RAG] Found ${newRows.length} relevant documents in new table`);
-          return newRows.map((r) => r.content);
-        }
-      } catch (newTableError) {
-        console.warn(`[RAG] Error searching new table: ${newTableError.message}`);
-      }
-    }
-    
-    // Fall back to original table
+    const tableName = hasNewTable ? "blender_knowledge_new" : "blender_knowledge";
     const query = `
       SELECT content, 1 - (embedding <=> $1) AS similarity
-      FROM blender_knowledge
-      WHERE 1 - (embedding <=> $1) > 0.2
+      FROM ${tableName}
+      WHERE 1 - (embedding <=> $1) > $2
       ORDER BY similarity DESC
-      LIMIT $2
+      LIMIT $3
     `;
-    const { rows } = await pool.query(query, [vectorString, limit]);
-    console.log(`✅ [RAG] Found ${rows.length} relevant documents in original table`);
-    return rows.map((r) => r.content);
+    const { rows } = await pool.query(query, [vectorString, MIN_SIMILARITY, limit]);
+    
+    // Deduplicate similar results
+    const uniqueResults = deduplicateResults(rows);
+    
+    console.log(`✅ [RAG] Found ${uniqueResults.length} relevant documents (similarity > ${MIN_SIMILARITY})`);
+    return uniqueResults.map((r) => ({
+      content: r.content,
+      similarity: r.similarity
+    }));
   } catch (error) {
     console.error(`❌ [RAG] Knowledge base search failed:`, error?.message || error);
     return [];
@@ -174,12 +204,23 @@ const AgentStateAnnotation = Annotation.Root({
 const searchKnowledgeBaseTool = tool(
   async ({ query }) => {
     console.log(`🔍 [LangGraph] Searching knowledge base for: "${query}"`);
-    const docs = await searchKnowledgeBase(query, 5);
+    const results = await searchKnowledgeBase(query, 5);
+    
+    // Extract content for ragContext (backward compatibility)
+    const docs = results.map(r => r.content || r);
+    
+    // Provide detailed results with similarity scores
+    const detailedResults = results.map(r => ({
+      content: r.content || r,
+      similarity: r.similarity || 0
+    }));
+    
     return {
       success: true,
       documents: docs,
+      detailedResults: detailedResults,
       count: docs.length,
-      message: `Found ${docs.length} relevant documents for query: "${query}"`,
+      message: `Found ${docs.length} relevant documents for query: "${query}" (avg similarity: ${(detailedResults.reduce((sum, r) => sum + r.similarity, 0) / detailedResults.length || 0).toFixed(2)})`,
     };
   },
   {
@@ -221,6 +262,97 @@ const getSceneInfoTool = tool(
   }
 );
 
+// Helper function to auto-fix common Blender code issues
+async function autoFixBlenderCode(code, error) {
+  if (!error) return code;
+  
+  const errorStr = String(error).toLowerCase();
+  let fixedCode = code;
+  
+  // Fix common import issues
+  if (errorStr.includes("name 'bpy' is not defined") || errorStr.includes("no module named 'bpy'")) {
+    if (!/\bimport\s+bpy\b/.test(fixedCode)) {
+      fixedCode = "import bpy\n" + fixedCode;
+    }
+  }
+  
+  // Fix context issues
+  if (errorStr.includes("context") && errorStr.includes("invalid")) {
+    // Add context check before operations
+    if (!/bpy\.context\.object/.test(fixedCode) && /bpy\.ops\./.test(fixedCode)) {
+      fixedCode = "if bpy.context.object:\n    " + fixedCode.replace(/\n/g, "\n    ");
+    }
+  }
+  
+  // Fix mode issues
+  if (errorStr.includes("mode") || errorStr.includes("edit mode")) {
+    if (/\bbmesh\b/.test(fixedCode) && !/mode_set\s*\(\s*mode\s*=\s*['"]EDIT['"]\s*\)/.test(fixedCode)) {
+      fixedCode = "if bpy.context.object and bpy.context.object.mode != 'EDIT':\n    bpy.ops.object.mode_set(mode='EDIT')\n" + fixedCode;
+    }
+  }
+  
+  // Fix selection issues
+  if (errorStr.includes("no active object") || errorStr.includes("nothing selected")) {
+    if (!/bpy\.ops\.object\.select_all/.test(fixedCode) && /bpy\.ops\.object\./.test(fixedCode)) {
+      fixedCode = "if bpy.data.objects:\n    bpy.ops.object.select_all(action='SELECT')\n" + fixedCode;
+    }
+  }
+  
+  return fixedCode;
+}
+
+// Retry logic for Blender code execution
+async function executeBlenderCodeWithRetry(code, maxRetries = 3) {
+  let lastError = null;
+  let lastResult = null;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const result = await sendCommand("execute_code", { code });
+      
+      if (result?.status === "error" || result?.executed === false) {
+        lastError = result?.error || result?.result || "Unknown execution error";
+        lastResult = result;
+        
+        // If execution failed and we have retries left, try to fix the code
+        if (attempt < maxRetries) {
+          console.log(`⚠️ [Retry ${attempt}/${maxRetries}] Blender code execution failed, attempting auto-fix...`);
+          code = await autoFixBlenderCode(code, lastError);
+          // Wait before retry (exponential backoff)
+          await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+          continue;
+        }
+      } else {
+        // Success!
+        return { success: true, result, code };
+      }
+    } catch (error) {
+      lastError = error.message || String(error);
+      
+      // If it's a connection error, don't retry
+      if (lastError.includes("not connected") || lastError.includes("connection")) {
+        throw new Error(`Blender connection error: ${lastError}`);
+      }
+      
+      // If we have retries left, try to fix and retry
+      if (attempt < maxRetries) {
+        console.log(`⚠️ [Retry ${attempt}/${maxRetries}] Blender code execution error, attempting auto-fix...`);
+        code = await autoFixBlenderCode(code, lastError);
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+        continue;
+      }
+    }
+  }
+  
+  // All retries exhausted
+  return { 
+    success: false, 
+    error: lastError || "Execution failed after all retries",
+    result: lastResult,
+    code 
+  };
+}
+
 const executeBlenderCodeTool = tool(
   async ({ code }) => {
     if (!isBlenderConnected()) {
@@ -261,24 +393,20 @@ const executeBlenderCodeTool = tool(
 
     const sanitizedCode = sanitizeBlenderCode(code);
     
-    try {
-      const result = await sendCommand("execute_code", { code: sanitizedCode });
-      if (result?.status === "error" || result?.executed === false) {
-        return {
-          success: false,
-          error: result?.error || result?.result || "Unknown execution error",
-          result: result,
-        };
-      }
+    // Execute with retry logic
+    const retryResult = await executeBlenderCodeWithRetry(sanitizedCode, 3);
+    
+    if (retryResult.success) {
       return {
         success: true,
-        result: result,
-        message: `Code executed successfully. Output: ${result?.result || "No output"}`,
+        result: retryResult.result,
+        message: `Code executed successfully. Output: ${retryResult.result?.result || "No output"}`,
       };
-    } catch (error) {
+    } else {
       return {
         success: false,
-        error: `Code execution failed: ${error.message}`,
+        error: retryResult.error || "Code execution failed after retries",
+        result: retryResult.result,
       };
     }
   },
@@ -1120,6 +1248,122 @@ print('3D object created based on request!')`;
   }
 }
 
+// Helper function to execute a subtask with timeout
+async function executeSubtaskWithTimeout(subtask, state, timeout = 60000) {
+  console.log(`⚡ [Parallel Execution] Starting subtask ${subtask.id}: ${subtask.description}`);
+  
+  return new Promise(async (resolve) => {
+    const timeoutId = setTimeout(() => {
+      resolve({
+        subtaskId: subtask.id,
+        success: false,
+        error: 'Subtask execution timeout',
+        timedOut: true
+      });
+    }, timeout);
+    
+    try {
+      // Execute the subtask's tool
+      let toolResult;
+      const toolInput = subtask.parameters;
+      
+      switch (subtask.tool) {
+        case "search_knowledge_base":
+          toolResult = await searchKnowledgeBaseTool.invoke(toolInput);
+          break;
+        case "get_scene_info":
+          toolResult = await getSceneInfoTool.invoke(toolInput);
+          break;
+        case "execute_blender_code":
+          toolResult = await executeBlenderCodeTool.invoke(toolInput);
+          break;
+        case "asset_search_and_import":
+          toolResult = await assetSearchAndImportTool.invoke(toolInput);
+          break;
+        case "analyze_image":
+          toolResult = await analyzeImageTool.invoke(toolInput);
+          break;
+        case "create_animation":
+          toolResult = await createAnimationTool.invoke(toolInput);
+          break;
+        default:
+          toolResult = {
+            success: false,
+            error: `Unknown tool: ${subtask.tool}`
+          };
+      }
+      
+      clearTimeout(timeoutId);
+      resolve({
+        subtaskId: subtask.id,
+        ...toolResult
+      });
+    } catch (error) {
+      clearTimeout(timeoutId);
+      resolve({
+        subtaskId: subtask.id,
+        success: false,
+        error: error.message
+      });
+    }
+  });
+}
+
+// Helper function to process parallel execution results
+function processParallelResults(state, results, executedSubtasks) {
+  const newCompletedSubtasks = [...state.completedSubtasks];
+  const newSubtaskResults = { ...state.subtaskResults };
+  const messages = [];
+  let anySuccessful = false;
+  let allSuccessful = true;
+  
+  results.forEach((result, index) => {
+    const subtask = executedSubtasks[index];
+    
+    if (result.status === 'fulfilled') {
+      const toolResult = result.value;
+      newCompletedSubtasks.push(toolResult.subtaskId);
+      newSubtaskResults[toolResult.subtaskId] = toolResult;
+      
+      if (toolResult.success) {
+        anySuccessful = true;
+        messages.push(`✅ Subtask ${toolResult.subtaskId} completed: ${subtask.description}`);
+      } else {
+        allSuccessful = false;
+        messages.push(`❌ Subtask ${toolResult.subtaskId} failed: ${toolResult.error || 'Unknown error'}`);
+      }
+    } else {
+      allSuccessful = false;
+      newCompletedSubtasks.push(subtask.id);
+      newSubtaskResults[subtask.id] = {
+        success: false,
+        error: result.reason?.message || 'Subtask execution rejected'
+      };
+      messages.push(`❌ Subtask ${subtask.id} rejected: ${result.reason?.message || 'Unknown error'}`);
+    }
+  });
+  
+  // Find the next index to continue from
+  let newCurrentSubtaskIndex = state.currentSubtaskIndex;
+  while (newCurrentSubtaskIndex < state.taskDecomposition.subtasks.length &&
+         newCompletedSubtasks.includes(state.taskDecomposition.subtasks[newCurrentSubtaskIndex].id)) {
+    newCurrentSubtaskIndex++;
+  }
+  
+  const summaryMessage = `Parallel execution completed: ${executedSubtasks.length} subtasks executed (${anySuccessful ? 'some' : 'none'} successful)`;
+  messages.unshift(summaryMessage);
+  
+  return {
+    messages: [new AIMessage(messages.join('\n'))],
+    completedSubtasks: newCompletedSubtasks,
+    subtaskResults: newSubtaskResults,
+    currentSubtaskIndex: newCurrentSubtaskIndex,
+    loopCount: state.loopCount + 1,
+    finished: newCurrentSubtaskIndex >= state.taskDecomposition.subtasks.length,
+    attachments: state.attachments,
+  };
+}
+
 // Agent node
 async function agentNode(state, config) {
   const { model = "gemini" } = config || {};
@@ -1185,7 +1429,54 @@ async function agentNode(state, config) {
     };
   }
 
-  // Step 2: Execute current subtask if available
+  // Step 2: Check for parallel execution opportunities
+  // Find all subtasks that can run in parallel (all dependencies met, not yet executed)
+  const readySubtasks = taskDecomposition.subtasks.filter((subtask, idx) => {
+    // Not yet executed
+    if (completedSubtasks.includes(subtask.id)) return false;
+    
+    // Skip finish_task tool - always execute sequentially
+    if (subtask.tool === 'finish_task') return false;
+    
+    // All dependencies met
+    const depsComplete = (subtask.dependencies || []).every(depId => 
+      completedSubtasks.includes(depId)
+    );
+    
+    // Check conditional execution
+    const description = subtask.description.toLowerCase();
+    if (description.includes("if") && description.includes("failed")) {
+      const dependencyFailed = subtask.dependencies?.some(depId => {
+        const depResult = subtaskResults[depId];
+        return depResult && !depResult.success;
+      });
+      if (!dependencyFailed) return false; // Skip if condition not met
+    } else if (description.includes("if") && (description.includes("succeeded") || description.includes("success"))) {
+      const dependencySucceeded = subtask.dependencies?.some(depId => {
+        const depResult = subtaskResults[depId];
+        return depResult && depResult.success;
+      });
+      if (!dependencySucceeded) return false; // Skip if condition not met
+    }
+    
+    return depsComplete;
+  });
+  
+  if (readySubtasks.length > 1) {
+    // Execute independent subtasks in parallel
+    console.log(`⚡ [Parallel Execution] Executing ${readySubtasks.length} independent subtasks in parallel`);
+    
+    const results = await Promise.allSettled(
+      readySubtasks.map(subtask => 
+        executeSubtaskWithTimeout(subtask, state)
+      )
+    );
+    
+    // Process results and update state
+    return processParallelResults(state, results, readySubtasks);
+  }
+
+  // Step 3: Execute current subtask if available (sequential fallback)
   if (currentSubtaskIndex < taskDecomposition.subtasks.length) {
     const currentSubtask = taskDecomposition.subtasks[currentSubtaskIndex];
     
@@ -1266,7 +1557,7 @@ async function agentNode(state, config) {
     };
   }
 
-  // Step 3: All subtasks completed, finish the task
+  // Step 4: All subtasks completed, finish the task
   console.log(`✅ [Completion] All ${taskDecomposition.subtasks.length} subtasks completed successfully!`);
   return {
     messages: [new AIMessage(`Task completed! All ${taskDecomposition.subtasks.length} subtasks executed successfully.`)],
@@ -1326,7 +1617,64 @@ async function toolNode(state) {
         toolResult = await createAnimationTool.invoke(toolInput);
         break;
       case "finish_task":
-        toolResult = await finishTaskTool.invoke(toolInput);
+        // Validate that critical subtasks succeeded before finishing
+        let hasFailures = false;
+        let failureDetails = [];
+        
+        if (taskDecomposition && subtaskResults) {
+          // Check all non-finish subtasks for failures
+          for (const subtask of taskDecomposition.subtasks) {
+            // Skip the finish_task itself
+            if (subtask.tool === 'finish_task') continue;
+            
+            const result = subtaskResults[subtask.id];
+            const description = subtask.description.toLowerCase();
+            
+            // A task is conditional/fallback ONLY if it explicitly states "if [something] failed/cannot/not found"
+            // AND has the failure condition at the START of the description
+            const isConditionalFallback = /^if\s+(.*?)\s+(failed|cannot|not\s+found|unsuccessful)/i.test(description);
+            
+            // Check if this subtask failed
+            if (result && !result.success && !result.skipped) {
+              // If it's not a conditional fallback, or if ALL its dependencies also failed, it's a real failure
+              if (!isConditionalFallback) {
+                // For primary tasks, check if any of its dependencies succeeded
+                // If a dependency succeeded, this task should have worked
+                const hasDependencies = subtask.dependencies && subtask.dependencies.length > 0;
+                
+                if (!hasDependencies) {
+                  // No dependencies - this is a primary task that failed
+                  hasFailures = true;
+                  failureDetails.push(`Subtask ${subtask.id} (${subtask.description}): ${result.error || 'Failed'}`);
+                } else {
+                  // Has dependencies - check if any succeeded
+                  const anyDepSucceeded = subtask.dependencies.some(depId => {
+                    const depResult = subtaskResults[depId];
+                    return depResult && depResult.success;
+                  });
+                  
+                  if (anyDepSucceeded) {
+                    // Dependency worked but this failed - that's a problem
+                    hasFailures = true;
+                    failureDetails.push(`Subtask ${subtask.id} (${subtask.description}): ${result.error || 'Failed'}`);
+                  }
+                }
+              }
+            }
+          }
+        }
+        
+        if (hasFailures) {
+          toolResult = {
+            success: false,
+            finished: true,
+            error: `Task completed with failures:\n${failureDetails.join('\n')}`,
+            finalAnswer: toolInput.finalAnswer,
+            partialSuccess: true
+          };
+        } else {
+          toolResult = await finishTaskTool.invoke(toolInput);
+        }
         break;
       default:
         throw new Error(`Unknown tool: ${toolName}`);
@@ -1350,7 +1698,11 @@ async function toolNode(state) {
       } else if (toolName === "create_animation") {
         responseMessage = toolResult.message || "Animation created successfully";
       } else if (toolName === "finish_task") {
-        responseMessage = toolResult.message || "Task completed";
+        if (toolResult.partialSuccess) {
+          responseMessage = `Task completed with issues: ${toolResult.error || 'Some subtasks failed'}`;
+        } else {
+          responseMessage = toolResult.message || "Task completed";
+        }
       } else {
         responseMessage = "Tool executed successfully";
       }
