@@ -511,14 +511,29 @@ const ChatInterface = () => {
       fetchConversations();
     } catch (err) {
       console.error("Send error", err);
-      setError(err.message || "Unable to generate response");
+      
+      // Convert technical errors to user-friendly messages
+      let userFriendlyError = err.message || "Unable to generate response";
+      
+      if (userFriendlyError.includes("Branch condition") || 
+          userFriendlyError.includes("null destination") ||
+          userFriendlyError.includes("FATAL ERROR")) {
+        userFriendlyError = "I encountered an issue while processing your request. Please try again or rephrase your prompt.";
+      } else if (userFriendlyError.includes("timeout") || userFriendlyError.includes("Timeout")) {
+        userFriendlyError = "The request took too long to process. Please try a simpler prompt or check your Blender connection.";
+      } else if (userFriendlyError.includes("not connected") || userFriendlyError.includes("Connection")) {
+        userFriendlyError = "Unable to connect to Blender. Please ensure Blender is running with the MCP addon enabled on port 9876.";
+      }
+      
+      setError(userFriendlyError);
+      // Restore the original input so user can try again
       setInput(originalInputValue);
       setMessages((prev) => [
         ...prev.filter((msg) => !String(msg.id).startsWith("temp-")),
         {
           id: `error-${Date.now()}`,
           role: "assistant",
-          content: `Error: ${err.message || "Unable to generate response"}`,
+          content: userFriendlyError,
           timestamp: new Date().toISOString(),
           isError: true,
         },
@@ -1306,21 +1321,27 @@ const ChatInterface = () => {
                     <div className="space-y-4">
                       {message.enhancedPrompt && message.enhancedPrompt !== message.content && (
                         <div className="mb-3 p-3 rounded-lg bg-blue-50 border border-blue-200 text-blue-700 dark:bg-blue-900/20 dark:border-blue-800/50 dark:text-blue-200">
-                          <p className="text-xs mb-1 font-medium text-blue-600 dark:text-blue-300">Enhanced Prompt:</p>
+                          <p className="text-xs mb-1 font-medium text-blue-600 dark:text-blue-300">✨ Enhanced Prompt:</p>
                           <p className="text-sm text-inherit">{message.enhancedPrompt}</p>
                         </div>
                       )}
-                      {message.sceneContext && (
+                      {message.sceneContext && message.sceneContext.object_count > 0 && (
                         <div className="mb-3 p-3 rounded-lg bg-purple-50 border border-purple-200 text-purple-700 dark:bg-purple-900/20 dark:border-purple-800/50 dark:text-purple-200">
-                          <p className="text-xs text-purple-600 dark:text-purple-300 mb-1 font-medium">Scene Context:</p>
+                          <p className="text-xs text-purple-600 dark:text-purple-300 mb-1 font-medium">🎨 Scene Status:</p>
                           <p className="text-sm text-inherit">
-                            {message.sceneContext.objects?.length || 0} objects in scene
+                            {message.sceneContext.object_count} object{message.sceneContext.object_count !== 1 ? 's' : ''} in your scene
+                            {message.sceneContext.objects && message.sceneContext.objects.length > 0 && (
+                              <span className="block mt-1 text-xs opacity-75">
+                                ({message.sceneContext.objects.slice(0, 3).map(obj => obj.name || obj).join(', ')}
+                                {message.sceneContext.objects.length > 3 ? '...' : ''})
+                              </span>
+                            )}
                           </p>
                         </div>
                       )}
                       {message.blenderResult && (
                         <div className="mb-3 p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 dark:bg-green-900/20 dark:border-green-800/50 dark:text-green-200">
-                          <p className="text-xs text-emerald-600 dark:text-green-300 mb-1 font-medium">Blender Status:</p>
+                          <p className="text-xs text-emerald-600 dark:text-green-300 mb-1 font-medium">🔧 Blender Status:</p>
                           <p className="text-sm text-inherit">
                             {message.blenderResult.error
                               ? `Error: ${message.blenderResult.error}`
@@ -1329,7 +1350,7 @@ const ChatInterface = () => {
                         </div>
                       )}
                       {message.content && (
-                        <div>
+                        <div className="prose prose-sm dark:prose-invert max-w-none">
                           {formatAssistantMessage(message.content)}
                         </div>
                       )}

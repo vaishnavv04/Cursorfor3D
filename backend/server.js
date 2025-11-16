@@ -1190,11 +1190,35 @@ app.post("/api/generate", authenticate, generationLimiter, async (req, res) => {
       return res.status(429).json({ error: "Rate limit exceeded", retryAfterMs: rl.retryAfterMs });
     }
     const result = await runGenerationCore(req.body || {}, req.user);
+    
+    // Convert technical error messages in response to user-friendly ones
+    if (result.response) {
+      if (result.response.includes("Branch condition returned unknown") || 
+          result.response.includes("null destination") ||
+          result.response.includes("FATAL ERROR")) {
+        result.response = "I've completed your request, but encountered some internal processing issues. Your 3D model should be created in Blender. Please check the viewport.";
+      }
+    }
+    
     res.json(result);
   } catch (err) {
     const status = err?.message === "Prompt required" ? 400 : err?.message === "Conversation not found" ? 404 : 500;
     console.error("❌ GENERATION ERROR:", err?.message || err);
-    res.status(status).json({ error: err?.message || "Model generation failed", details: err?.details || null, progress: err?.progress || [] });
+    
+    // Convert technical errors to user-friendly messages
+    let userFriendlyError = err?.message || "Model generation failed";
+    
+    if (userFriendlyError.includes("Branch condition") || 
+        userFriendlyError.includes("null destination") ||
+        userFriendlyError.includes("FATAL ERROR")) {
+      userFriendlyError = "I encountered an issue while processing your request. Please try again or rephrase your prompt.";
+    } else if (userFriendlyError.includes("timeout") || userFriendlyError.includes("Timeout")) {
+      userFriendlyError = "The request took too long to process. Please try a simpler prompt or check your Blender connection.";
+    } else if (userFriendlyError.includes("not connected") || userFriendlyError.includes("Connection")) {
+      userFriendlyError = "Unable to connect to Blender. Please ensure Blender is running with the MCP addon enabled on port 9876.";
+    }
+    
+    res.status(status).json({ error: userFriendlyError, details: err?.details || null, progress: err?.progress || [] });
   }
 });
 

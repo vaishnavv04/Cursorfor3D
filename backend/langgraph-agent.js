@@ -1309,6 +1309,31 @@ async function executeSubtaskWithTimeout(subtask, state, timeout = 60000) {
   });
 }
 
+// Helper function to create complete agent state updates
+function createAgentStateUpdate(state, updates = {}) {
+  return {
+    messages: updates.messages || [],
+    sceneContext: updates.sceneContext !== undefined ? updates.sceneContext : state.sceneContext,
+    ragContext: updates.ragContext !== undefined ? updates.ragContext : state.ragContext,
+    integrationStatus: updates.integrationStatus || state.integrationStatus,
+    loopCount: updates.loopCount !== undefined ? updates.loopCount : state.loopCount,
+    maxLoops: state.maxLoops,
+    blenderAvailable: updates.blenderAvailable !== undefined ? updates.blenderAvailable : state.blenderAvailable,
+    conversationId: updates.conversationId !== undefined ? updates.conversationId : state.conversationId,
+    searchHistory: updates.searchHistory || state.searchHistory,
+    assetGenerated: updates.assetGenerated !== undefined ? updates.assetGenerated : state.assetGenerated,
+    animationGenerated: updates.animationGenerated !== undefined ? updates.animationGenerated : state.animationGenerated,
+    taskDecomposition: updates.taskDecomposition !== undefined ? updates.taskDecomposition : state.taskDecomposition,
+    currentSubtaskIndex: updates.currentSubtaskIndex !== undefined ? updates.currentSubtaskIndex : state.currentSubtaskIndex,
+    completedSubtasks: updates.completedSubtasks || state.completedSubtasks,
+    subtaskResults: updates.subtaskResults || state.subtaskResults,
+    attachments: updates.attachments || state.attachments,
+    toolName: updates.toolName !== undefined ? updates.toolName : null,
+    toolInput: updates.toolInput || {},
+    finished: updates.finished !== undefined ? updates.finished : state.finished,
+  };
+}
+
 // Helper function to process parallel execution results
 function processParallelResults(state, results, executedSubtasks) {
   const newCompletedSubtasks = [...state.completedSubtasks];
@@ -1353,15 +1378,17 @@ function processParallelResults(state, results, executedSubtasks) {
   const summaryMessage = `Parallel execution completed: ${executedSubtasks.length} subtasks executed (${anySuccessful ? 'some' : 'none'} successful)`;
   messages.unshift(summaryMessage);
   
-  return {
+  // Return complete state using helper function
+  return createAgentStateUpdate(state, {
     messages: [new AIMessage(messages.join('\n'))],
+    currentSubtaskIndex: newCurrentSubtaskIndex,
     completedSubtasks: newCompletedSubtasks,
     subtaskResults: newSubtaskResults,
-    currentSubtaskIndex: newCurrentSubtaskIndex,
     loopCount: state.loopCount + 1,
     finished: newCurrentSubtaskIndex >= state.taskDecomposition.subtasks.length,
-    attachments: state.attachments,
-  };
+    toolName: null,
+    toolInput: {},
+  });
 }
 
 // Agent node
@@ -1389,44 +1416,40 @@ async function agentNode(state, config) {
 
   // Check if task is already finished
   if (state.finished) {
-    return {
+    return createAgentStateUpdate(state, {
       messages: [new AIMessage("Task already completed.")],
       finished: true,
       loopCount: loopCount + 1,
-      attachments: attachments,
-    };
+    });
   }
 
   if (loopCount >= maxLoops) {
-    return {
+    return createAgentStateUpdate(state, {
       messages: [new AIMessage("Task completed or reached maximum steps. All possible subtasks have been executed.")],
       finished: true,
       loopCount: loopCount + 1,
-      attachments: attachments, // Preserve attachments
-    };
+    });
   }
 
   const lastHumanMessage = messages.filter(msg => msg instanceof HumanMessage).pop();
   if (!lastHumanMessage) {
-    return {
+    return createAgentStateUpdate(state, {
       messages: [new AIMessage("No user message found.")],
       finished: true,
-      attachments: attachments, // Preserve attachments
-    };
+    });
   }
 
   // Step 1: Decompose task if not already done
   if (!taskDecomposition) {
     console.log(`🧩 [First Turn] Decomposing task into atomic subtasks...`);
     console.log(`🧩 [Debug] Available attachments: ${attachments?.length || 0}`);
-    return {
+    return createAgentStateUpdate(state, {
       messages: [new AIMessage("I will decompose your request into atomic subtasks.")],
       toolName: "decompose_task",
       toolInput: { userRequest: lastHumanMessage.content, attachments: attachments || [] },
       loopCount: loopCount + 1,
       finished: false,
-      attachments: attachments, // Preserve attachments
-    };
+    });
   }
 
   // Step 2: Check for parallel execution opportunities
@@ -1491,12 +1514,11 @@ async function agentNode(state, config) {
         // Dependencies not met, wait for them to complete
         const missingDeps = currentSubtask.dependencies.filter(depId => !completedSubtasks.includes(depId));
         console.log(`⏳ [Waiting] Subtask ${currentSubtaskIndex + 1}: Waiting for dependencies ${missingDeps.join(', ')}`);
-        return {
+        return createAgentStateUpdate(state, {
           messages: [new AIMessage(`Waiting for dependencies to complete before executing subtask ${currentSubtaskIndex + 1}`)],
           loopCount: loopCount + 1,
           finished: false,
-          attachments: attachments,
-        };
+        });
       }
     }
     
@@ -1513,15 +1535,14 @@ async function agentNode(state, config) {
       if (!dependencyFailed) {
         // Condition not met (dependency didn't fail), skip this subtask
         console.log(`⏭️ [Skipping] Subtask ${currentSubtaskIndex + 1}: Condition not met (dependency succeeded)`);
-        return {
+        return createAgentStateUpdate(state, {
           messages: [new AIMessage(`Skipping subtask ${currentSubtaskIndex + 1}: Previous subtask succeeded, condition not met`)],
           loopCount: loopCount + 1,
           finished: false,
           currentSubtaskIndex: currentSubtaskIndex + 1,
-          completedSubtasks: [...completedSubtasks, currentSubtask.id], // Mark as skipped
+          completedSubtasks: [...completedSubtasks, currentSubtask.id],
           subtaskResults: { ...subtaskResults, [currentSubtask.id]: { success: true, skipped: true, reason: "Condition not met" } },
-          attachments: attachments,
-        };
+        });
       }
     } else if (description.includes("if") && (description.includes("succeeded") || description.includes("success"))) {
       // Check if any dependency subtask succeeded
@@ -1533,38 +1554,35 @@ async function agentNode(state, config) {
       if (!dependencySucceeded) {
         // Condition not met (dependency didn't succeed), skip this subtask
         console.log(`⏭️ [Skipping] Subtask ${currentSubtaskIndex + 1}: Condition not met (dependency failed)`);
-        return {
+        return createAgentStateUpdate(state, {
           messages: [new AIMessage(`Skipping subtask ${currentSubtaskIndex + 1}: Previous subtask failed, condition not met`)],
           loopCount: loopCount + 1,
           finished: false,
           currentSubtaskIndex: currentSubtaskIndex + 1,
-          completedSubtasks: [...completedSubtasks, currentSubtask.id], // Mark as skipped
+          completedSubtasks: [...completedSubtasks, currentSubtask.id],
           subtaskResults: { ...subtaskResults, [currentSubtask.id]: { success: true, skipped: true, reason: "Condition not met" } },
-          attachments: attachments,
-        };
+        });
       }
     }
     
     console.log(`⚡ [Executing] Subtask ${currentSubtaskIndex + 1}/${taskDecomposition.subtasks.length}: ${currentSubtask.description}`);
     
-    return {
+    return createAgentStateUpdate(state, {
       messages: [new AIMessage(`Executing subtask ${currentSubtaskIndex + 1}: ${currentSubtask.description}`)],
       toolName: currentSubtask.tool,
       toolInput: currentSubtask.parameters,
       loopCount: loopCount + 1,
       finished: false,
-      attachments: attachments, // Preserve attachments
-    };
+    });
   }
 
   // Step 4: All subtasks completed, finish the task
   console.log(`✅ [Completion] All ${taskDecomposition.subtasks.length} subtasks completed successfully!`);
-  return {
+  return createAgentStateUpdate(state, {
     messages: [new AIMessage(`Task completed! All ${taskDecomposition.subtasks.length} subtasks executed successfully.`)],
     finished: true,
     loopCount: loopCount + 1,
-    attachments: attachments, // Preserve attachments
-  };
+  });
 }
 
 // Tool node
@@ -1682,13 +1700,21 @@ async function toolNode(state) {
 
     console.log(`✅ [LangGraph] Tool result:`, toolResult);
 
-    // Build response message based on tool result
+    // Get user request from first human message
+    const userRequest = state.messages.filter(msg => msg instanceof HumanMessage)[0]?.content || "";
+    
+    // Generate user-friendly response
+    const friendlyResponse = generateFriendlyResponse(toolName, toolResult, state, userRequest);
+    
+    // Build response message - use friendly version if available, otherwise technical
     let responseMessage;
-    if (toolResult.success) {
+    if (friendlyResponse) {
+      responseMessage = friendlyResponse;
+    } else if (toolResult.success) {
       if (toolName === "decompose_task") {
         responseMessage = `Task decomposed into ${toolResult.decomposition.subtasks.length} subtasks: ${toolResult.decomposition.subtasks.map((s, i) => `${i + 1}. ${s.description}`).join(', ')}`;
       } else if (toolName === "search_knowledge_base") {
-        responseMessage = `Found ${toolResult.documents?.length || 0} relevant documents`;
+        responseMessage = null; // Skip RAG searches
       } else if (toolName === "execute_blender_code") {
         responseMessage = toolResult.message || "Blender code executed successfully";
       } else if (toolName === "asset_search_and_import") {
@@ -1707,7 +1733,8 @@ async function toolNode(state) {
         responseMessage = "Tool executed successfully";
       }
     } else {
-      responseMessage = `Tool execution failed: ${toolResult.error || toolResult.message || "Unknown error"}`;
+      // Don't show technical errors to users
+      responseMessage = null;
     }
 
     // Update task decomposition state
@@ -1742,8 +1769,11 @@ async function toolNode(state) {
     const isFinished = toolName === "finish_task" || toolResult.finished || 
                      (taskDecomposition && newCurrentSubtaskIndex >= taskDecomposition.subtasks.length && toolResult.success);
     
+    // Only add message if there's something to show the user
+    const messagesToAdd = responseMessage ? [new AIMessage(responseMessage)] : [];
+    
     return {
-      messages: [new AIMessage(responseMessage)],
+      messages: messagesToAdd,
       ragContext: toolName === "search_knowledge_base" && toolResult.documents ? toolResult.documents : ragContext,
       sceneContext: toolName === "get_scene_info" && toolResult.scene ? toolResult.scene : state.sceneContext,
       finished: isFinished,
@@ -1769,17 +1799,112 @@ async function toolNode(state) {
   }
 }
 
+// Helper function to generate user-friendly conversational responses
+function generateFriendlyResponse(toolName, toolResult, state, userRequest) {
+  const { taskDecomposition, completedSubtasks, subtaskResults } = state;
+  
+  if (toolName === "decompose_task" && toolResult.success) {
+    return `Okay! I'll help you ${userRequest.toLowerCase()}. Let me break this down into steps and get started! 🎨`;
+  }
+  
+  if (toolName === "search_knowledge_base") {
+    return null; // Skip showing RAG searches to users
+  }
+  
+  if (toolName === "get_scene_info") {
+    const objCount = toolResult.sceneContext?.object_count || 0;
+    return `I can see you have ${objCount} object${objCount !== 1 ? 's' : ''} in your scene. Let me work on enhancing ${objCount > 0 ? 'them' : 'your scene'}! ✨`;
+  }
+  
+  if (toolName === "asset_search_and_import") {
+    if (toolResult.success) {
+      const assetName = toolResult.assetResult?.name || "the 3D model";
+      return `Great news! I found and imported ${assetName} using ${toolResult.assetResult?.source || 'an external library'}. 🎉`;
+    } else {
+      return `I couldn't find a pre-made model for that, but no worries! I'll create it from scratch using Blender. 🛠️`;
+    }
+  }
+  
+  if (toolName === "execute_blender_code") {
+    if (toolResult.success) {
+      // Try to extract what was created from the code or result
+      const result = toolResult.result?.result || "";
+      if (result.includes("created")) {
+        return `Perfect! I've ${result.toLowerCase().replace("!", "")}. Working on the details now... 🎨`;
+      }
+      return `Working on your model... Adding the shapes and details! 🔧`;
+    } else {
+      return `Hmm, I encountered a small issue. Let me try a different approach... 🔄`;
+    }
+  }
+  
+  if (toolName === "analyze_image") {
+    if (toolResult.success) {
+      return `I've analyzed your image! I can see what you want to create. Let me bring it to life in 3D! 🖼️✨`;
+    }
+  }
+  
+  if (toolName === "create_animation") {
+    if (toolResult.success) {
+      const animType = toolResult.animation?.type || "animation";
+      return `Awesome! I've added a ${animType} animation to your model. It should look really cool now! 🎬`;
+    }
+  }
+  
+  if (toolName === "finish_task") {
+    // Generate a comprehensive summary
+    const objCount = state.sceneContext?.object_count || 0;
+    const assetGenerated = state.assetGenerated;
+    const animationGenerated = state.animationGenerated;
+    
+    let response = `\n\n✅ **Here you go!** I've completed your request.\n\n`;
+    
+    // Describe what was done
+    if (assetGenerated) {
+      response += `🎨 I imported a 3D model from an online library.\n`;
+    } else {
+      response += `🛠️ I created the 3D model from scratch using Blender code.\n`;
+    }
+    
+    if (animationGenerated) {
+      response += `🎬 I added animation to bring it to life.\n`;
+    }
+    
+    if (objCount > 0) {
+      response += `📊 Your scene now has ${objCount} object${objCount !== 1 ? 's' : ''}.\n`;
+    }
+    
+    response += `\n💡 **Want to make changes?** You can ask me to:\n`;
+    response += `   • Change colors or materials\n`;
+    response += `   • Add more details or objects\n`;
+    response += `   • Adjust size or position\n`;
+    response += `   • Add animations or effects\n`;
+    response += `\nWhat would you like to do next? 😊`;
+    
+    return response;
+  }
+  
+  return null; // Return null for internal messages
+}
+
 // Conditional routing function
 function shouldContinue(state) {
+  // Log state for debugging
+  console.log(`🔀 [Router] Evaluating routing: finished=${state.finished}, loopCount=${state.loopCount}/${state.maxLoops}, toolName=${state.toolName || 'null'}`);
+  
   if (state.finished) {
+    console.log(`🏁 [Router] Task finished, routing to END`);
     return END;
   }
   if (state.loopCount >= state.maxLoops) {
+    console.log(`🚫 [Router] Max loops reached, routing to END`);
     return END;
   }
   if (state.toolName) {
+    console.log(`🔧 [Router] Tool specified (${state.toolName}), routing to tools`);
     return "tools";
   }
+  console.log(`🔄 [Router] Continuing to agent node`);
   return "agent";
 }
 
@@ -1845,8 +1970,30 @@ export async function runLangGraphAgent(prompt, options = {}) {
   const workflow = createAgentWorkflow();
   const result = await workflow.invoke(initialState, { configurable: { model } });
 
+  // Compile all AI messages (excluding internal/technical ones) into a conversational response
+  const aiMessages = result.messages
+    .filter(msg => msg instanceof AIMessage && msg.content && msg.content.trim().length > 0)
+    .map(msg => msg.content);
+  
+  // Generate final user-friendly response
+  let finalResponse;
+  if (aiMessages.length > 0) {
+    // If we have a finish_task message with full summary, use that
+    const finishMessage = aiMessages.find(msg => msg.includes("✅") && msg.includes("Here you go"));
+    if (finishMessage) {
+      finalResponse = finishMessage;
+    } else {
+      // Otherwise, combine all messages into a natural flow
+      finalResponse = aiMessages.join("\n\n");
+    }
+  } else {
+    // Fallback if no messages (shouldn't happen but just in case)
+    const objCount = result.sceneContext?.object_count || 0;
+    finalResponse = `✅ Done! I've completed your request. Your scene now has ${objCount} object${objCount !== 1 ? 's' : ''}.\n\nWhat would you like to do next? 😊`;
+  }
+
   return {
-    response: result.messages[result.messages.length - 1]?.content || "No response generated.",
+    response: finalResponse,
     messages: result.messages,
     sceneContext: result.sceneContext,
     loopCount: result.loopCount,
