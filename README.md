@@ -647,6 +647,12 @@ MIT License - See [LICENSE](LICENSE) file
 
 **Built with ❤️ by [vaishnavv04](https://github.com/vaishnavv04)**
 
+### Contributors
+
+[![vaishnavv04](https://github.com/vaishnavv04.png?size=50)](https://github.com/vaishnavv04)
+[![Snehartha](https://github.com/Snehartha.png?size=50)](https://github.com/Snehartha)
+[![Saikrishna-3101](https://github.com/Saikrishna-3101.png?size=50)](https://github.com/Saikrishna-3101)
+
 *Star ⭐ this repository if you find it helpful!*
 
 **Last Updated:** January 2025
