@@ -140,3 +140,6 @@ CONVERSATIONAL_UX_IMPROVEMENTS.md
 VISION_VALIDATION_IMPLEMENTATION.md
 VISION_VALIDATION_TESTING.md
 LANGGRAPH_README.md
+
+# Large knowledge base files
+backend/scripts/knowledge/blender_python_reference_4_5.zip

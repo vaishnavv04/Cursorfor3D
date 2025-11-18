@@ -289,6 +289,8 @@ CREATE EXTENSION IF NOT EXISTS vector;
 **5. Initialize Knowledge Base**
 ```bash
 cd backend
+# Download Blender 4.5 API documentation first
+# Place blender_python_reference_4_5.zip in backend/scripts/knowledge/
 node scripts/embed_docs.js
 # Embeds 2044+ Blender API documentation chunks
 ```
