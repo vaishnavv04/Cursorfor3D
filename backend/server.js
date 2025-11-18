@@ -19,6 +19,7 @@ import { getRandomGeminiKey } from "./utils/simple-api-keys.js";
 import { integrationModules, initBlenderConnection, sendCommand, isBlenderConnected } from './integrations/index.js';
 import { runLangGraphAgent } from "./langgraph-agent.js";
 import { apiLimiter, authLimiter, generationLimiter } from "./middleware/security.js";
+import logger from "./utils/logger.js";
 import path from "node:path";
 import os from "node:os";
 
@@ -40,7 +41,7 @@ const BLENDER_TCP_HOST = process.env.BLENDER_TCP_HOST || "127.0.0.1";
 const JWT_SECRET = process.env.JWT_SECRET;
 
 if (!JWT_SECRET) {
-  console.error("JWT_SECRET environment variable is required for authentication.");
+  logger.error("JWT_SECRET environment variable is required for authentication.");
   process.exit(1);
 }
 
@@ -67,7 +68,7 @@ const EXPECTED_EMBEDDING_DIM = 380; // Match the existing table dimension
 let embedderPromise = null;
 async function getEmbedder() {
   if (embedderPromise === null) {
-    console.log("🤖 Loading local embedding model...");
+    logger.info("Loading local embedding model", { model: EMBEDDING_MODEL_NAME });
     embedderPromise = pipeline("feature-extraction", EMBEDDING_MODEL_NAME);
   }
   return embedderPromise;
@@ -90,13 +91,13 @@ async function tableExists(tableName) {
     );
     return rows[0].exists;
   } catch (error) {
-    console.error(`Error checking if table exists: ${error.message}`);
+    logger.error(`Error checking if table exists`, { table: tableName, error: error.message });
     return false;
   }
 }
 
 async function searchKnowledgeBase(queryText, limit = 5) {
-  console.log(`🔍 [RAG] Searching knowledge base for: "${String(queryText).slice(0, 100)}..."`);
+  logger.info(`[RAG] Searching knowledge base`, { query: queryText.slice(0, 100), limit });
   try {
     const queryEmbedding = await embedQuery(queryText);
     const vectorString = pgvector.toSql(queryEmbedding);
@@ -116,11 +117,11 @@ async function searchKnowledgeBase(queryText, limit = 5) {
         `;
         const { rows: newRows } = await pool.query(newTableQuery, [vectorString, limit]);
         if (newRows && newRows.length > 0) {
-          console.log(`✅ [RAG] Found ${newRows.length} relevant documents in new table`);
+          logger.info(`[RAG] Found ${newRows.length} relevant documents in new table`);
           return newRows.map((r) => r.content);
         }
       } catch (newTableError) {
-        console.warn(`[RAG] Error searching new table: ${newTableError.message}`);
+        logger.warn(`[RAG] Error searching new table: ${newTableError.message}`);
       }
     }
     
@@ -133,10 +134,10 @@ async function searchKnowledgeBase(queryText, limit = 5) {
       LIMIT $2
     `;
     const { rows } = await pool.query(query, [vectorString, limit]);
-    console.log(`✅ [RAG] Found ${rows.length} relevant documents in original table`);
+    logger.info(`[RAG] Found ${rows.length} relevant documents in original table`);
     return rows.map((r) => r.content);
   } catch (error) {
-    console.error(`❌ [RAG] Knowledge base search failed:`, error?.message || error);
+    logger.error(`[RAG] Knowledge base search failed`, { error: error?.message || error });
     return [];
   }
 }
@@ -237,7 +238,7 @@ async function callAgentLLM(systemPrompt, agentHistory, model = "gemini") {
     if (!jsonMatch) throw new Error("No JSON object found in LLM response.");
     return JSON.parse(jsonMatch[0]);
   } catch (err) {
-    console.error("Agent LLM returned invalid JSON:", rawResponseText);
+    logger.error("Agent LLM returned invalid JSON", { response: rawResponseText.slice(0, 500), parseError: err.message });
     throw new Error("Agent LLM returned invalid JSON.");
   }
 }
@@ -266,7 +267,7 @@ async function ensureRagForPrompt(prompt, maxDocs = 5) {
     const docs = await searchKnowledgeBase(prompt, maxDocs);
     return docs && docs.length ? docs : [];
   } catch (err) {
-    console.warn("RAG search failed:", err?.message || err);
+    logger.warn("RAG search failed in ensureRagForPrompt", { error: err?.message || err });
     return [];
   }
 }
@@ -314,8 +315,14 @@ const crypto = cryptoModule;
 const CODE_CACHE_MAX = Number(process.env.CODE_CACHE_MAX || 100);
 const CODE_CACHE_TTL_MS = Number(process.env.CODE_CACHE_TTL_MS || 5 * 60 * 1000);
 const codeGenCache = new Map();
-function cacheKeyFromPrompt(fullPrompt) {
-  const h = crypto.createHash("sha256").update(fullPrompt || "").digest("hex");
+function cacheKeyFromPrompt(fullPrompt, userId, conversationId) {
+  // Include userId and conversationId to prevent cache collision between different users/contexts
+  const composite = JSON.stringify({
+    prompt: fullPrompt || "",
+    userId: userId || "anonymous",
+    conversationId: conversationId || "none"
+  });
+  const h = cryptoModule.createHash("sha256").update(composite).digest("hex");
   return h;
 }
 function cacheGet(key) {
@@ -405,9 +412,14 @@ function summarizeText(text, maxLength = 400) {
 // We just need to track connection status for server logic
 let blenderConnected = false;
 
+// Connection retry tracking
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 10;
+const BASE_RETRY_DELAY = 5000; // 5 seconds
+
 async function initializeBlenderConnection() {
   try {
-    console.log(`Attempting to connect to Blender at ${BLENDER_TCP_HOST}:${BLENDER_TCP_PORT}`);
+    logger.info(`Attempting to connect to Blender`, { host: BLENDER_TCP_HOST, port: BLENDER_TCP_PORT, attempt: reconnectAttempts + 1 });
     
     // Initialize the connection using our integration module
     await initBlenderConnection();
@@ -415,22 +427,45 @@ async function initializeBlenderConnection() {
     // Set our connection flag using the centralized connection status
     blenderConnected = isBlenderConnected();
     
+    // Reset reconnect attempts on success
+    reconnectAttempts = 0;
+    
     // Check integrations status
     try {
       const status = await fetchIntegrationStatusFromBlender(true);
-      console.log(`Integration status: Hyper3D: ${status.hyper3d ? '✅' : '❌'}, PolyHaven: ${status.polyhaven ? '✅' : '❌'}, Sketchfab: ${status.sketchfab ? '✅' : '❌'}`);
+      logger.info(`Integration status checked`, { status });
     } catch (err) {
-      console.warn(`Failed to check integration status: ${err.message}`);
+      logger.warn(`Failed to check integration status`, { error: err.message });
     }
     
-    console.log("✅ Connected to Blender TCP server");
+    logger.info("Connected to Blender TCP server successfully");
   } catch (err) {
-    console.error(`❌ Failed to connect to Blender: ${err.message}`);
+    logger.error(`Failed to connect to Blender`, { error: err.message, host: BLENDER_TCP_HOST, port: BLENDER_TCP_PORT });
     blenderConnected = false;
     
-    // Retry after 5 seconds
-    console.log("Will retry connection in 5 seconds...");
-    setTimeout(() => initializeBlenderConnection(), 5000);
+    // Implement exponential backoff with max attempts
+    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+      reconnectAttempts++;
+      const delay = Math.min(
+        BASE_RETRY_DELAY * Math.pow(2, reconnectAttempts - 1),
+        60000 // Max 60 seconds
+      );
+      
+      logger.info(`Will retry connection in ${delay}ms...`, { 
+        attempt: reconnectAttempts, 
+        maxAttempts: MAX_RECONNECT_ATTEMPTS 
+      });
+      
+      setTimeout(() => {
+        initializeBlenderConnection().catch(retryErr => {
+          logger.error(`Reconnect attempt ${reconnectAttempts} failed`, { error: retryErr.message });
+        });
+      }, delay);
+    } else {
+      logger.error(`Max reconnection attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Manual intervention required.`, {
+        suggestion: "Please ensure Blender is running with the MCP addon active on port " + BLENDER_TCP_PORT
+      });
+    }
   }
 }
 
@@ -519,7 +554,7 @@ async function fetchIntegrationStatusFromBlender(force = false) {
     return status;
   } catch (err) {
     // if Blender call fails, mark integrations as false but keep prior cache briefly
-    console.warn("Integration status check failed:", err?.message || err);
+    logger.warn("Integration status check failed", { error: err?.message || err });
     integrationStatusCache.at = now; // avoid hammering
     integrationStatusCache.value = integrationStatusCache.value || { hyper3d: false, polyhaven: false, sketchfab: false };
     return integrationStatusCache.value;
@@ -572,7 +607,7 @@ async function authenticate(req, res, next) {
     req.token = token;
     next();
   } catch (err) {
-    console.error("❌ Auth error:", err?.message || err);
+    logger.error("Authentication middleware failed", { error: err?.message || err });
     return res.status(401).json({ error: "Invalid or expired token" });
   }
 }
@@ -687,7 +722,7 @@ Enhanced prompt:
       return enhanced || userPrompt;
     }
   } catch (error) {
-    console.error("❌ Prompt enhancement failed:", error?.message || error);
+    logger.error("Prompt enhancement failed", { error: error?.message || error });
   }
   return userPrompt;
 }
@@ -697,7 +732,7 @@ Enhanced prompt:
    ========================= */
 async function runGenerationCore(body, user) {
   const { prompt, conversationId, attachments = [], captureScreenshot = false, debug = false, model = "gemini" } = body || {};
-  console.log(`[LangGraph Agent] Starting new generation task. Model: ${model}, User: ${user.id}`);
+  logger.info(`[LangGraph Agent] Starting new generation task`, { model, userId: user.id, conversationId });
   const startedAt = Date.now();
   const progress = createProgressTracker();
   let analyticsRecorded = false;
@@ -822,7 +857,7 @@ async function runGenerationCore(body, user) {
       langGraph: true, // Flag to indicate LangGraph was used
     };
   } catch (err) {
-    console.error("❌ [LangGraph Agent] FATAL ERROR in runGenerationCore:", err);
+    logger.error("[LangGraph Agent] FATAL ERROR in runGenerationCore", { error: err?.message || err, stack: err?.stack });
     if (!analyticsRecorded) {
       analytics.totalGenerations += 1;
       analytics.errors += 1;
@@ -845,7 +880,7 @@ app.post("/api/auth/signup", authLimiter, async (req, res) => {
     const token = signToken(userRow);
     res.json({ token, user: toPublicUser(userRow) });
   } catch (err) {
-    console.error("❌ Signup error:", err?.message || err);
+    logger.error("Signup error", { error: err?.message || err });
     res.status(500).json({ error: "Failed to create account" });
   }
 });
@@ -862,7 +897,7 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
     const token = signToken(userRow);
     res.json({ token, user: toPublicUser(userRow) });
   } catch (err) {
-    console.error("❌ Login error:", err?.message || err);
+    logger.error("Login error", { error: err?.message || err });
     res.status(500).json({ error: "Login failed" });
   }
 });
@@ -882,7 +917,7 @@ app.get("/api/conversations", authenticate, async (req, res) => {
     const conversations = await listUserConversations(req.user.id);
     res.json({ conversations });
   } catch (err) {
-    console.error("❌ Fetch conversations error:", err?.message || err);
+    logger.error("Fetch conversations error", { error: err?.message || err, userId: req.user.id });
     res.status(500).json({ error: "Failed to load conversations" });
   }
 });
@@ -898,7 +933,7 @@ app.post("/api/conversation/new", authenticate, async (req, res) => {
     const conversation = await createConversation(req.user.id, title);
     res.json({ conversation });
   } catch (err) {
-    console.error("❌ Create conversation error:", err?.message || err);
+    logger.error("Create conversation error", { error: err?.message || err, userId: req.user.id });
     res.status(500).json({ error: "Failed to create conversation" });
   }
 });
@@ -916,7 +951,7 @@ app.get("/api/conversation/:conversationId", authenticate, async (req, res) => {
     const messages = await getConversationMessages(conversationId);
     res.json({ conversation, messages });
   } catch (err) {
-    console.error("❌ Get conversation error:", err?.message || err);
+    logger.error("Get conversation error", { error: err?.message || err, userId: req.user.id, conversationId: req.params.conversationId });
     res.status(500).json({ error: "Failed to load conversation" });
   }
 });
@@ -933,7 +968,7 @@ app.delete("/api/conversation/:conversationId", authenticate, async (req, res) =
     if (!deleted) return res.status(404).json({ error: "Conversation not found" });
     res.json({ success: true });
   } catch (err) {
-    console.error("❌ Delete conversation error:", err?.message || err);
+    logger.error("Delete conversation error", { error: err?.message || err, userId: req.user.id, conversationId: req.params.conversationId });
     res.status(500).json({ error: "Failed to delete conversation" });
   }
 });
@@ -959,7 +994,7 @@ app.post("/api/enhance-prompt", authenticate, async (req, res) => {
     const enhanced = await enhancePrompt(prompt.trim(), conversationHistory);
     res.json({ enhancedPrompt: enhanced });
   } catch (err) {
-    console.error("❌ Enhance prompt error:", err?.message || err);
+    logger.error("Enhance prompt error", { error: err?.message || err, userId: req.user.id });
     res.status(500).json({ error: "Failed to enhance prompt", details: err?.message || null });
   }
 });
@@ -985,7 +1020,7 @@ app.post("/api/feedback", authenticate, async (req, res) => {
     await pool.query(`UPDATE messages SET metadata = jsonb_set(coalesce(metadata,'{}'::jsonb), '{feedback}', $1::jsonb, true) WHERE id=$2`, [JSON.stringify(fb), messageId]);
     res.json({ ok: true });
   } catch (err) {
-    console.error("❌ Feedback error:", err?.message || err);
+    logger.error("Feedback error", { error: err?.message || err, userId: req.user.id });
     res.status(500).json({ error: "Failed to record feedback" });
   }
 });
@@ -1075,7 +1110,7 @@ app.post("/api/validate-key", authenticate, async (req, res) => {
       ...(errorMessage && { error: errorMessage })
     });
   } catch (error) {
-    console.error(`❌ API key validation error for ${service}:`, error.message);
+    logger.error(`API key validation error`, { service, error: error.message });
     res.status(500).json({ valid: false, error: "Validation failed: " + error.message });
   }
 });
@@ -1097,7 +1132,7 @@ app.post("/api/scene-info", authenticate, async (req, res) => {
     }
     res.json(sceneInfo);
   } catch (err) {
-    console.error("❌ Scene info error:", err?.message || err);
+    logger.error("Scene info error", { error: err?.message || err, userId: req.user.id });
     res.status(500).json({ error: "Failed to get scene info" });
   }
 });
@@ -1107,6 +1142,106 @@ app.get("/api/analytics/summary", authenticate, async (req, res) => {
   const avgAttempts = analytics.totalGenerations ? analytics.totalAttempts / analytics.totalGenerations : 0;
   const avgDurationMs = analytics.totalGenerations ? analytics.totalDurationMs / analytics.totalGenerations : 0;
   res.json({ windowMs: RATE_LIMIT_WINDOW_MS, totalGenerations: analytics.totalGenerations, success: analytics.success, errors: analytics.errors, avgAttempts, avgDurationMs });
+});
+
+// Health monitoring endpoint
+app.get("/api/health", async (req, res) => {
+  try {
+    const health = {
+      status: "healthy",
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime(),
+      services: {}
+    };
+
+    // Check Blender connection
+    health.services.blender = {
+      connected: isBlenderConnected(),
+      host: BLENDER_TCP_HOST,
+      port: BLENDER_TCP_PORT
+    };
+
+    // Check database connectivity
+    try {
+      await pool.query('SELECT 1');
+      health.services.database = {
+        status: "connected",
+        connectionString: process.env.DATABASE_URL ? "configured" : "missing"
+      };
+    } catch (dbErr) {
+      health.services.database = {
+        status: "disconnected",
+        error: dbErr.message
+      };
+      health.status = "degraded";
+    }
+
+    // Check API key availability
+    const testGeminiKey = getRandomGeminiKey();
+    health.services.apiKeys = {
+      gemini: testGeminiKey ? "configured" : "missing",
+      groq: groqClient ? "configured" : "missing"
+    };
+
+    // Check integration status
+    if (isBlenderConnected()) {
+      try {
+        const integrationStatus = await integrationModules.checkIntegrationStatus();
+        health.services.integrations = {
+          hyper3d: integrationStatus.hyper3d ? "enabled" : "disabled",
+          polyhaven: integrationStatus.polyhaven ? "enabled" : "disabled",
+          sketchfab: integrationStatus.sketchfab ? "enabled" : "disabled"
+        };
+
+        // Check circuit breaker states
+        health.services.circuitBreakers = {
+          hyper3d: integrationModules.hyper3d.getCircuitBreakerState(),
+          sketchfab: integrationModules.sketchfab.getCircuitBreakerState(),
+          polyhaven: integrationModules.polyhaven.getCircuitBreakerState()
+        };
+      } catch (err) {
+        health.services.integrations = { error: "Unable to check integration status" };
+        health.services.circuitBreakers = { error: err.message };
+      }
+    } else {
+      health.services.integrations = { status: "unavailable", reason: "Blender not connected" };
+      health.services.circuitBreakers = { status: "unavailable", reason: "Blender not connected" };
+    }
+
+    // Check RAG system
+    try {
+      const hasNewTable = await tableExists("blender_knowledge_new");
+      const hasOldTable = await tableExists("blender_knowledge");
+      health.services.rag = {
+        status: (hasNewTable || hasOldTable) ? "available" : "not initialized",
+        tables: {
+          blender_knowledge_new: hasNewTable,
+          blender_knowledge: hasOldTable
+        },
+        embeddingModel: EMBEDDING_MODEL_NAME
+      };
+    } catch (err) {
+      health.services.rag = {
+        status: "error",
+        error: err.message
+      };
+    }
+
+    // Set overall status
+    if (!health.services.blender.connected || health.services.database.status !== "connected") {
+      health.status = "degraded";
+    }
+
+    const statusCode = health.status === "healthy" ? 200 : health.status === "degraded" ? 503 : 500;
+    res.status(statusCode).json(health);
+  } catch (err) {
+    logger.error("Health check error", { error: err.message });
+    res.status(500).json({
+      status: "error",
+      error: err.message,
+      timestamp: new Date().toISOString()
+    });
+  }
 });
 
 // Suggest
@@ -1203,7 +1338,7 @@ app.post("/api/generate", authenticate, generationLimiter, async (req, res) => {
     res.json(result);
   } catch (err) {
     const status = err?.message === "Prompt required" ? 400 : err?.message === "Conversation not found" ? 404 : 500;
-    console.error("❌ GENERATION ERROR:", err?.message || err);
+    logger.error("GENERATION ERROR", { error: err?.message || err, userId: req.user.id, stack: err?.stack });
     
     // Convert technical errors to user-friendly messages
     let userFriendlyError = err?.message || "Model generation failed";
@@ -1246,15 +1381,15 @@ app.get("/api/models", authenticate, async (req, res) => {
 (async () => {
   try {
     // Initialize database schema
-    console.log("📊 Initializing database schema...");
+    logger.info("Initializing database schema");
     await initSchema();
-    console.log("✅ Database schema initialized");
+    logger.info("Database schema initialized successfully");
     
     // Pre-load the embedding model for RAG
     getEmbedder().then(() => {
-      console.log("✅ Local embedding model loaded and ready.");
+      logger.info("Local embedding model loaded and ready", { model: EMBEDDING_MODEL_NAME });
     }).catch(err => {
-      console.error("⚠️ Failed to pre-load local embedding model:", err?.message || err);
+      logger.warn("Failed to pre-load local embedding model", { error: err?.message || err });
     });
     
     // Initialize Blender connection using our integration module
@@ -1262,24 +1397,24 @@ app.get("/api/models", authenticate, async (req, res) => {
     
     // Start the Express server
     app.listen(PORT, () => {
-      console.log(`🚀 Backend running at http://localhost:${PORT}`);
+      logger.info(`Backend running`, { port: PORT, url: `http://localhost:${PORT}` });
       
       // Log API configuration
       const testKey = getRandomGeminiKey();
-      if (testKey) console.log(`🤖 Gemini API: ✅ Configured with random key selection`);
-      else console.log(`🤖 Gemini API: ❌ Not configured. Set GEMINI_API_KEY_1, GEMINI_API_KEY_2, etc. in .env to enable.`);
+      if (testKey) logger.info(`Gemini API: Configured with random key selection`);
+      else logger.warn(`Gemini API: Not configured. Set GEMINI_API_KEY_1, GEMINI_API_KEY_2, etc. in .env to enable.`);
       
-      if (groqClient) console.log(`🚀 Groq API: ✅ Configured`);
-      else console.log(`🚀 Groq API: ❌ Not configured. Set GROQ_API_KEY in .env to enable.`);
+      if (groqClient) logger.info(`Groq API: Configured`);
+      else logger.warn(`Groq API: Not configured. Set GROQ_API_KEY in .env to enable.`);
       
-      console.log(`📚 RAG Model: ${EMBEDDING_MODEL_NAME}`);
+      logger.info(`RAG Model: ${EMBEDDING_MODEL_NAME}`);
     });
   } catch (err) {
-    console.error("💥 Startup Error:", err?.message || err);
+    logger.error("Startup Error", { error: err?.message || err, stack: err?.stack });
     if ((err?.message || "").includes("ENOTFOUND") || (err?.message || "").includes("getaddrinfo")) {
-      console.error("💡 DNS/network error. Check DATABASE_URL, connectivity and database host.");
+      logger.error("DNS/network error. Check DATABASE_URL, connectivity and database host.");
     }
-    console.error("❌ Backend cannot start without database connection (required for authentication)");
+    logger.error("Backend cannot start without database connection (required for authentication)");
     process.exit(1);
   }
 })();

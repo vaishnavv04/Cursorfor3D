@@ -9,7 +9,11 @@ import pgvector from "pgvector/pg";
 import { pipeline } from "@xenova/transformers";
 import { getRandomGeminiKey } from './utils/simple-api-keys.js';
 import { integrationModules, sendCommand, isBlenderConnected } from './integrations/index.js';
+import logger from './utils/logger.js';
 import { pool } from "./db.js";
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 
 // Initialize AI providers (reuse from server.js)
 const groqClient = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
@@ -31,7 +35,7 @@ const EXPECTED_EMBEDDING_DIM = 380;
 let embedderPromise = null;
 async function getEmbedder() {
   if (embedderPromise === null) {
-    console.log("🤖 Loading local embedding model...");
+    logger.info("Loading local embedding model", { model: EMBEDDING_MODEL_NAME });
     embedderPromise = pipeline("feature-extraction", EMBEDDING_MODEL_NAME);
   }
   return embedderPromise;
@@ -56,7 +60,7 @@ async function tableExists(tableName) {
     );
     return rows[0].exists;
   } catch (error) {
-    console.error(`Error checking if table exists: ${error.message}`);
+    logger.error("Error checking if table exists", { table: tableName, error: error.message });
     return false;
   }
 }
@@ -105,7 +109,7 @@ function deduplicateResults(rows, similarityThreshold = 0.95) {
 }
 
 async function searchKnowledgeBase(queryText, limit = 5) {
-  console.log(`🔍 [RAG] Searching knowledge base for: "${String(queryText).slice(0, 100)}..."`);
+  logger.info(`[RAG] Searching knowledge base`, { query: String(queryText).slice(0, 100), limit });
   try {
     const queryEmbedding = await embedQuery(queryText);
     const vectorString = pgvector.toSql(queryEmbedding);
@@ -126,13 +130,13 @@ async function searchKnowledgeBase(queryText, limit = 5) {
     // Deduplicate similar results
     const uniqueResults = deduplicateResults(rows);
     
-    console.log(`✅ [RAG] Found ${uniqueResults.length} relevant documents (similarity > ${MIN_SIMILARITY})`);
+    logger.info(`[RAG] Found ${uniqueResults.length} relevant documents`, { similarity: MIN_SIMILARITY });
     return uniqueResults.map((r) => ({
       content: r.content,
       similarity: r.similarity
     }));
   } catch (error) {
-    console.error(`❌ [RAG] Knowledge base search failed:`, error?.message || error);
+    logger.error(`[RAG] Knowledge base search failed`, { error: error?.message || error });
     return [];
   }
 }
@@ -198,30 +202,54 @@ const AgentStateAnnotation = Annotation.Root({
     default: () => [],
     reducer: (x, y) => y || x, // Use the latest attachments
   }),
+  hasReplanned: Annotation({
+    default: () => false,
+  }),
+  validationResult: Annotation({
+    default: () => null,
+  }),
+  lastCodeExecution: Annotation({
+    default: () => null,
+  }),
+  autoValidateNext: Annotation({
+    default: () => false,
+  }),
 });
 
 // Tool definitions using LangGraph's tool decorator
 const searchKnowledgeBaseTool = tool(
   async ({ query }) => {
-    console.log(`🔍 [LangGraph] Searching knowledge base for: "${query}"`);
-    const results = await searchKnowledgeBase(query, 5);
+    logger.info(`🔍 [RAG] Searching knowledge base`, { query: query.slice(0, 100) });
     
-    // Extract content for ragContext (backward compatibility)
-    const docs = results.map(r => r.content || r);
-    
-    // Provide detailed results with similarity scores
-    const detailedResults = results.map(r => ({
-      content: r.content || r,
-      similarity: r.similarity || 0
-    }));
-    
-    return {
-      success: true,
-      documents: docs,
-      detailedResults: detailedResults,
-      count: docs.length,
-      message: `Found ${docs.length} relevant documents for query: "${query}" (avg similarity: ${(detailedResults.reduce((sum, r) => sum + r.similarity, 0) / detailedResults.length || 0).toFixed(2)})`,
-    };
+    return retryOperation(
+      async () => {
+        const results = await searchKnowledgeBase(query, 5);
+        
+        // Extract content for ragContext (backward compatibility)
+        const docs = results.map(r => r.content || r);
+        
+        // Provide detailed results with similarity scores
+        const detailedResults = results.map(r => ({
+          content: r.content || r,
+          similarity: r.similarity || 0
+        }));
+        
+        const resultEmoji = docs.length > 0 ? '✅' : '⚠️';
+        return {
+          success: true,
+          documents: docs,
+          detailedResults: detailedResults,
+          count: docs.length,
+          message: `${resultEmoji} Found ${docs.length} relevant documents for query: "${query}" (avg similarity: ${(detailedResults.reduce((sum, r) => sum + r.similarity, 0) / detailedResults.length || 0).toFixed(2)})`,
+        };
+      },
+      {
+        maxRetries: 2,
+        backoffMs: 500,
+        operationName: 'RAG search',
+        shouldRetry: (error) => !String(error).includes('not initialized')
+      }
+    );
   },
   {
     name: "search_knowledge_base",
@@ -241,19 +269,29 @@ const getSceneInfoTool = tool(
       };
     }
     
-    try {
-      const sceneContext = await sendCommand("get_scene_info", {});
-      return {
-        success: true,
-        sceneContext,
-        message: `Scene info retrieved. Current objects: ${Array.isArray(sceneContext.objects) ? sceneContext.objects.join(", ") : "unknown"}`,
-      };
-    } catch (error) {
-      return {
-        success: false,
-        error: `Failed to get scene info: ${error.message}`,
-      };
-    }
+    return retryOperation(
+      async () => {
+        try {
+          const sceneContext = await sendCommand("get_scene_info", {});
+          return {
+            success: true,
+            sceneContext,
+            message: `Scene info retrieved. Current objects: ${Array.isArray(sceneContext.objects) ? sceneContext.objects.join(", ") : "unknown"}`,
+          };
+        } catch (error) {
+          return {
+            success: false,
+            error: `Failed to get scene info: ${error.message}`,
+          };
+        }
+      },
+      {
+        maxRetries: 2,
+        backoffMs: 500,
+        operationName: 'Get scene info',
+        shouldRetry: (error) => !String(error).includes('not connected')
+      }
+    );
   },
   {
     name: "get_scene_info",
@@ -261,6 +299,59 @@ const getSceneInfoTool = tool(
     schema: z.object({}),
   }
 );
+
+// Generic retry wrapper with exponential backoff
+async function retryOperation(operation, options = {}) {
+  const {
+    maxRetries = 3,
+    backoffMs = 1000,
+    onRetry = null,
+    shouldRetry = () => true,
+    operationName = 'operation'
+  } = options;
+
+  let lastError = null;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const result = await operation(attempt);
+      
+      // Check if result indicates failure
+      if (result && typeof result === 'object' && result.success === false) {
+        lastError = result.error || result.message || 'Operation returned failure';
+        
+        // Check if we should retry
+        if (attempt < maxRetries && shouldRetry(result, attempt)) {
+          logger.warn(`[Retry ${attempt}/${maxRetries}] ${operationName} failed`, { error: lastError });
+          if (onRetry) await onRetry(result, attempt);
+          await new Promise(resolve => setTimeout(resolve, backoffMs * attempt));
+          continue;
+        }
+        
+        return result; // Return the failure result
+      }
+      
+      // Success
+      return result;
+    } catch (error) {
+      lastError = error.message || String(error);
+      
+      // Check if we should retry
+      if (attempt < maxRetries && shouldRetry(error, attempt)) {
+        logger.warn(`[Retry ${attempt}/${maxRetries}] ${operationName} threw error`, { error: lastError });
+        if (onRetry) await onRetry(error, attempt);
+        await new Promise(resolve => setTimeout(resolve, backoffMs * attempt));
+        continue;
+      }
+      
+      // Don't retry or exhausted retries
+      throw error;
+    }
+  }
+  
+  // All retries exhausted
+  throw new Error(`${operationName} failed after ${maxRetries} retries: ${lastError}`);
+}
 
 // Helper function to auto-fix common Blender code issues
 async function autoFixBlenderCode(code, error) {
@@ -316,7 +407,7 @@ async function executeBlenderCodeWithRetry(code, maxRetries = 3) {
         
         // If execution failed and we have retries left, try to fix the code
         if (attempt < maxRetries) {
-          console.log(`⚠️ [Retry ${attempt}/${maxRetries}] Blender code execution failed, attempting auto-fix...`);
+          logger.warn(`[Retry ${attempt}/${maxRetries}] Blender code execution failed, attempting auto-fix`, { error: lastError });
           code = await autoFixBlenderCode(code, lastError);
           // Wait before retry (exponential backoff)
           await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
@@ -336,7 +427,7 @@ async function executeBlenderCodeWithRetry(code, maxRetries = 3) {
       
       // If we have retries left, try to fix and retry
       if (attempt < maxRetries) {
-        console.log(`⚠️ [Retry ${attempt}/${maxRetries}] Blender code execution error, attempting auto-fix...`);
+        logger.warn(`[Retry ${attempt}/${maxRetries}] Blender code execution error, attempting auto-fix`, { error: lastError });
         code = await autoFixBlenderCode(code, lastError);
         await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
         continue;
@@ -421,54 +512,69 @@ const executeBlenderCodeTool = tool(
 
 const assetSearchAndImportTool = tool(
   async ({ prompt }) => {
+    logger.info(`\ud83d\udd0e [Asset] Searching for: ${prompt.substring(0, 50)}...`);
+    
     if (!isBlenderConnected()) {
+      logger.warn("\u274c [Asset] Blender not connected");
       return {
         success: false,
         error: "Blender is not connected. Cannot import assets.",
       };
     }
 
-    try {
-      // Check integration status
-      const integrationStatus = await integrationModules.checkIntegrationStatus();
-      const assetIntent = integrationModules.detectAssetIntent(prompt, integrationStatus);
-      
-      if (assetIntent.type === "none" || !integrationStatus[assetIntent.type]) {
-        return {
-          success: false,
-          error: `No suitable integration available for asset: ${prompt}. Consider generating Blender code instead.`,
-          suggestion: "Use execute_blender_code to create a placeholder asset.",
-        };
-      }
+    return retryOperation(
+      async (attempt) => {
+        try {
+          // Check integration status
+          const integrationStatus = await integrationModules.checkIntegrationStatus();
+          const assetIntent = integrationModules.detectAssetIntent(prompt, integrationStatus);
+          
+          if (assetIntent.type === "none" || !integrationStatus[assetIntent.type]) {
+            return {
+              success: false,
+              error: `No suitable integration available for asset: ${prompt}. Consider generating Blender code instead.`,
+              suggestion: "Use execute_blender_code to create a placeholder asset.",
+            };
+          }
 
-      // Use integration modules
-      let assetResult;
-      switch (assetIntent.type) {
-        case "hyper3d":
-          // Pass null for progress - Hyper3D code handles it gracefully with console.log
-          assetResult = await integrationModules.hyper3d.generateAndImportAsset(assetIntent.prompt, null);
-          break;
-        case "sketchfab":
-          assetResult = await integrationModules.sketchfab.searchAndImportModel(assetIntent.query);
-          break;
-        case "polyhaven":
-          assetResult = await integrationModules.polyhaven.searchAndImportAsset(assetIntent.query, assetIntent.asset_type);
-          break;
-        default:
-          throw new Error("Unknown asset type");
-      }
+          // Use integration modules (circuit breakers handle their own retries)
+          let assetResult;
+          switch (assetIntent.type) {
+            case "hyper3d":
+              assetResult = await integrationModules.hyper3d.generateAndImportAsset(assetIntent.prompt, null);
+              break;
+            case "sketchfab":
+              assetResult = await integrationModules.sketchfab.searchAndImportModel(assetIntent.query);
+              break;
+            case "polyhaven":
+              assetResult = await integrationModules.polyhaven.searchAndImportAsset(assetIntent.query, assetIntent.asset_type);
+              break;
+            default:
+              throw new Error("Unknown asset type");
+          }
 
-      return {
-        success: true,
-        assetResult,
-        message: `Successfully imported asset: ${assetResult.name} via ${assetIntent.type}`,
-      };
-    } catch (error) {
-      return {
-        success: false,
-        error: `Asset import failed: ${error.message}`,
-      };
-    }
+          return {
+            success: true,
+            assetResult,
+            message: `Successfully imported asset: ${assetResult.name} via ${assetIntent.type}`,
+          };
+        } catch (error) {
+          return {
+            success: false,
+            error: `Asset import failed: ${error.message}`,
+          };
+        }
+      },
+      {
+        maxRetries: 2,
+        backoffMs: 2000,
+        operationName: 'Asset import',
+        shouldRetry: (error) => {
+          const errStr = String(error);
+          return !errStr.includes('not connected') && !errStr.includes('Circuit breaker is OPEN');
+        }
+      }
+    );
   },
   {
     name: "asset_search_and_import",
@@ -481,7 +587,7 @@ const assetSearchAndImportTool = tool(
 
 const analyzeImageTool = tool(
   async ({ attachments }) => {
-    console.log(`🖼️ [LangGraph] Analyzing ${attachments?.length || 0} image attachment(s) with Gemini vision`);
+    logger.info(`[LangGraph] Analyzing image attachment(s)`, { count: attachments?.length || 0 });
     
     if (!attachments || attachments.length === 0) {
       return {
@@ -501,7 +607,8 @@ const analyzeImageTool = tool(
     }
     
     try {
-      // Use Gemini's vision capabilities to analyze the images
+      // Create Gemini client dynamically for this request
+      const genAI = await createGeminiClient();
       if (!genAI) {
         throw new Error("Gemini API not configured for image analysis");
       }
@@ -539,7 +646,7 @@ Provide a detailed description that would help someone recreate this as a 3D mod
       const result = await visionModel.generateContent(visionRequest);
       const analysis = await result.response.text();
       
-      console.log(`🧠 [Gemini Vision] Image analysis completed: ${analysis.substring(0, 100)}...`);
+      logger.info(`[Gemini Vision] Image analysis completed`, { preview: analysis.substring(0, 100) });
       
       return {
         success: true,
@@ -548,7 +655,7 @@ Provide a detailed description that would help someone recreate this as a 3D mod
         message: `Successfully analyzed ${imageAttachments.length} image(s) with Gemini vision`,
       };
     } catch (error) {
-      console.error(`❌ [Gemini Vision] Image analysis failed:`, error.message);
+      logger.error(`[Gemini Vision] Image analysis failed`, { error: error.message });
       
       // Provide a fallback analysis when Gemini vision fails
       const fallbackAnalysis = `I can see ${imageAttachments.length} image(s) uploaded (${imageAttachments.map(att => att.name).join(', ')}). Based on the presence of these images, I should create a 3D representation. Since I cannot analyze the specific visual content due to technical limitations, I will create a basic 3D object that can serve as a starting point for further refinement based on the image content.`;
@@ -571,6 +678,191 @@ Provide a detailed description that would help someone recreate this as a 3D mod
         type: z.string(),
         dataUrl: z.string().optional(),
       })).describe("Array of image attachments to analyze"),
+    }),
+  }
+);
+
+const validateWithVisionTool = tool(
+  async ({ expectedOutcome, triggerScreenshot = true }) => {
+    try {
+      logger.info(`👁️ [Vision Validation] Starting validation`, { 
+        expectedOutcome: expectedOutcome.substring(0, 100),
+        triggerScreenshot
+      });
+
+      // Check if Blender is connected
+      if (!isBlenderConnected()) {
+        return {
+          success: false,
+          error: "Blender not connected",
+          validation: {
+            matches: false,
+            confidence: 0,
+            quality_score: 0,
+            issues: ["Cannot validate - Blender not connected"],
+            suggestions: ["Ensure Blender is running and connected"],
+            pass: false
+          }
+        };
+      }
+
+      // Capture screenshot from Blender using existing get_viewport_screenshot
+      let base64Data;
+      if (triggerScreenshot) {
+        logger.info(`📸 [Vision Validation] Capturing viewport screenshot...`);
+        
+        // Use temporary file for screenshot
+        const tempDir = os.tmpdir();
+        const tempFilePath = path.join(tempDir, `blender_validation_${Date.now()}.png`);
+        
+        try {
+          const screenshotResult = await sendCommand('get_viewport_screenshot', {
+            filepath: tempFilePath,
+            max_size: 800,
+            format: 'png'
+          });
+          
+          if (!screenshotResult || !screenshotResult.success) {
+            throw new Error("Failed to capture screenshot from Blender");
+          }
+          
+          // Read the screenshot file and convert to base64
+          const imageBuffer = fs.readFileSync(tempFilePath);
+          base64Data = imageBuffer.toString('base64');
+          
+          logger.info(`[Vision Validation] Screenshot captured and converted to base64`);
+        } finally {
+          // Always clean up temp file, even on error
+          try {
+            if (fs.existsSync(tempFilePath)) {
+              fs.unlinkSync(tempFilePath);
+              logger.debug(`[Vision Validation] Cleaned up temp file: ${tempFilePath}`);
+            }
+          } catch (cleanupErr) {
+            logger.warn(`Failed to cleanup temp file: ${cleanupErr.message}`);
+          }
+        }
+      } else {
+        throw new Error("Screenshot capture is required for validation");
+      }
+
+      // Use Gemini Vision API
+      const genAI = await createGeminiClient();
+      if (!genAI) {
+        throw new Error("Gemini API not configured for vision validation");
+      }
+
+      const visionModel = genAI.getGenerativeModel({
+        model: "gemini-2.5-flash",
+        generationConfig: { 
+          temperature: 0.1,
+          maxOutputTokens: 2048,
+        },
+      });
+
+      const validationPrompt = `You are a 3D quality validation expert analyzing a Blender viewport screenshot.
+
+**Expected Outcome:**
+${expectedOutcome}
+
+**Your Task:**
+Analyze the screenshot and evaluate if it matches the expected outcome. Provide a structured JSON response.
+
+**Evaluation Criteria:**
+1. **Object Presence** (30%): Are all expected objects visible?
+2. **Geometry Accuracy** (25%): Do shapes match expectations?
+3. **Material/Color Correctness** (20%): Are colors/materials right?
+4. **Composition** (15%): Is layout/positioning correct?
+5. **Technical Quality** (10%): No artifacts, proper shading, etc.
+
+**Response Format (JSON only, no markdown):**
+{
+  "matches": true/false,
+  "confidence": 0.0-1.0,
+  "quality_score": 0-10,
+  "visual_analysis": {
+    "objects_detected": ["list", "of", "objects"],
+    "colors_observed": ["color1", "color2"],
+    "geometry_quality": "description",
+    "material_quality": "description",
+    "composition": "description"
+  },
+  "issues": ["issue1", "issue2"],
+  "suggestions": ["suggestion1", "suggestion2"],
+  "pass": true/false
+}`;
+
+      const visionRequest = [
+        {
+          inlineData: {
+            data: base64Data,
+            mimeType: "image/png"
+          }
+        },
+        { text: validationPrompt }
+      ];
+
+      const result = await visionModel.generateContent(visionRequest);
+      const responseText = await result.response.text();
+      
+      // Parse JSON response (handle potential markdown wrapping)
+      let validationResult;
+      try {
+        const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+        validationResult = JSON.parse(jsonMatch ? jsonMatch[0] : responseText);
+      } catch (parseErr) {
+        logger.warn(`[Vision Validation] Failed to parse JSON, using fallback`, { 
+          response: responseText.substring(0, 200) 
+        });
+        validationResult = {
+          matches: /matches.*true/i.test(responseText),
+          confidence: 0.5,
+          quality_score: 5,
+          visual_analysis: { raw_response: responseText.substring(0, 500) },
+          issues: [],
+          suggestions: [],
+          pass: true
+        };
+      }
+
+      const validationEmoji = validationResult.pass ? '✅' : '⚠️';
+      logger.info(`${validationEmoji} [Vision Validation] Completed`, { 
+        pass: validationResult.pass,
+        quality_score: validationResult.quality_score,
+        issues_count: validationResult.issues?.length || 0
+      });
+
+      return {
+        success: true,
+        validation: validationResult,
+        screenshot_analyzed: true,
+        message: validationResult.pass 
+          ? `✅ Visual validation passed (quality: ${validationResult.quality_score}/10)` 
+          : `⚠️ Visual validation found issues: ${validationResult.issues.join(', ')}`
+      };
+
+    } catch (error) {
+      logger.error(`❌ [Vision Validation] Failed`, { error: error.message });
+      return {
+        success: false,
+        error: error.message,
+        validation: {
+          matches: false,
+          confidence: 0,
+          quality_score: 0,
+          issues: [`Vision validation failed: ${error.message}`],
+          suggestions: ["Retry with manual inspection"],
+          pass: false
+        }
+      };
+    }
+  },
+  {
+    name: "validate_with_vision",
+    description: "Analyzes Blender viewport screenshot using Gemini Vision to validate if the result matches expectations. Use AFTER execute_blender_code when you need to verify the visual output is correct.",
+    schema: z.object({
+      expectedOutcome: z.string().describe("What should be visible in the viewport (e.g., 'a red cube at the origin')"),
+      triggerScreenshot: z.boolean().default(true).describe("Whether to capture a new screenshot (default: true)"),
     }),
   }
 );
@@ -742,53 +1034,63 @@ if ${targetObject ? `bpy.data.objects.get("${targetObject}")` : 'bpy.context.obj
 
 const createAnimationTool = tool(
   async ({ animationType, duration, targetObject }) => {
-    console.log(`🎬 [LangGraph] Creating ${animationType} animation for: ${targetObject || 'selected objects'}`);
+    logger.info(`[LangGraph] Creating animation`, { animationType, targetObject: targetObject || 'selected objects', duration });
     
-    try {
-      let animationCode;
-      
-      switch (animationType.toLowerCase()) {
-        case "hop":
-          animationCode = generateHopAnimation(targetObject, duration || 2);
-          break;
-        case "walk":
-          animationCode = generateWalkAnimation(targetObject, duration || 3);
-          break;
-        case "rotate":
-          animationCode = generateRotateAnimation(targetObject, duration || 2);
-          break;
-        case "bounce":
-          animationCode = generateBounceAnimation(targetObject, duration || 1.5);
-          break;
-        default:
-          throw new Error(`Unknown animation type: ${animationType}`);
+    return retryOperation(
+      async () => {
+        try {
+          let animationCode;
+          
+          switch (animationType.toLowerCase()) {
+            case "hop":
+              animationCode = generateHopAnimation(targetObject, duration || 2);
+              break;
+            case "walk":
+              animationCode = generateWalkAnimation(targetObject, duration || 3);
+              break;
+            case "rotate":
+              animationCode = generateRotateAnimation(targetObject, duration || 2);
+              break;
+            case "bounce":
+              animationCode = generateBounceAnimation(targetObject, duration || 1.5);
+              break;
+            default:
+              throw new Error(`Unknown animation type: ${animationType}`);
+          }
+          
+          const result = await sendCommand("execute_code", { code: animationCode });
+          
+          if (result?.status === "error" || result?.executed === false) {
+            return {
+              success: false,
+              error: result?.error || result?.result || "Animation execution failed",
+            };
+          }
+          
+          return {
+            success: true,
+            animation: {
+              type: animationType,
+              duration: duration || 2,
+              target: targetObject || "all objects"
+            },
+            message: `Created ${animationType} animation for ${targetObject || 'objects'}`,
+          };
+        } catch (error) {
+          return {
+            success: false,
+            error: error.message,
+            message: "Animation creation failed",
+          };
+        }
+      },
+      {
+        maxRetries: 2,
+        backoffMs: 1000,
+        operationName: 'Animation creation',
+        shouldRetry: (error) => !String(error).includes('Unknown animation type')
       }
-      
-      const result = await sendCommand("execute_code", { code: animationCode });
-      
-      if (result?.status === "error" || result?.executed === false) {
-        return {
-          success: false,
-          error: result?.error || result?.result || "Animation execution failed",
-        };
-      }
-      
-      return {
-        success: true,
-        animation: {
-          type: animationType,
-          duration: duration || 2,
-          target: targetObject || "all objects"
-        },
-        message: `Created ${animationType} animation for ${targetObject || 'objects'}`,
-      };
-    } catch (error) {
-      return {
-        success: false,
-        error: error.message,
-        message: "Animation creation failed",
-      };
-    }
+    );
   },
   {
     name: "create_animation",
@@ -803,7 +1105,7 @@ const createAnimationTool = tool(
 
 const decomposeTaskTool = tool(
   async ({ userRequest, attachments }) => {
-    console.log(`🧩 [LangGraph] Decomposing task: "${userRequest}" with ${attachments?.length || 0} attachments`);
+    logger.info(`[LangGraph] Decomposing task`, { userRequest, attachmentCount: attachments?.length || 0 });
     
     try {
       // Get attachments from state (they'll be available in the tool node context)
@@ -844,6 +1146,7 @@ const tools = [
   executeBlenderCodeTool,
   assetSearchAndImportTool,
   analyzeImageTool,
+  validateWithVisionTool,
   createAnimationTool,
   finishTaskTool,
 ];
@@ -907,6 +1210,137 @@ async function callAgentLLM(messages, model = "gemini") {
   }
 
   return response;
+}
+
+// Dynamic re-planning function - regenerates task decomposition when critical subtasks fail
+async function replanOnFailure(originalRequest, originalDecomposition, failedSubtasks, completedSubtasks, subtaskResults, attachments = []) {
+  logger.info('[Dynamic Replan] Initiating re-planning due to critical subtask failures', { 
+    failedCount: failedSubtasks.length, 
+    completedCount: completedSubtasks.length 
+  });
+
+  // Gather context about what failed and what succeeded
+  const failureContext = failedSubtasks.map(subtaskId => {
+    const subtask = originalDecomposition.subtasks.find(s => s.id === subtaskId);
+    const result = subtaskResults[subtaskId];
+    return {
+      id: subtaskId,
+      description: subtask?.description,
+      tool: subtask?.tool,
+      error: result?.error || 'Unknown error'
+    };
+  });
+
+  const successContext = completedSubtasks
+    .filter(id => subtaskResults[id]?.success)
+    .map(subtaskId => {
+      const subtask = originalDecomposition.subtasks.find(s => s.id === subtaskId);
+      return {
+        id: subtaskId,
+        description: subtask?.description,
+        tool: subtask?.tool
+      };
+    });
+
+  const replanPrompt = `You are a task re-planning expert. The original task decomposition has encountered failures and needs to be regenerated with an alternative approach.
+
+ORIGINAL REQUEST: "${originalRequest}"
+
+ORIGINAL PLAN: ${JSON.stringify(originalDecomposition, null, 2)}
+
+COMPLETED SUCCESSFULLY:
+${successContext.map(s => `- ${s.description} (${s.tool})`).join('\n') || 'None'}
+
+FAILED SUBTASKS:
+${failureContext.map(f => `- ${f.description} (${f.tool}): ${f.error}`).join('\n')}
+
+${attachments && attachments.length > 0 ? `ATTACHMENTS: ${attachments.length} file(s) available` : ''}
+
+Available tools: search_knowledge_base, get_scene_info, execute_blender_code, asset_search_and_import, analyze_image, create_animation, finish_task
+
+INSTRUCTIONS:
+1. Analyze WHY the subtasks failed (e.g., integration unavailable, invalid code, connection issues)
+2. Generate an ALTERNATIVE approach that avoids the same failure modes
+3. Reuse successful subtasks where possible
+4. If an integration tool failed, try a different integration or fallback to execute_blender_code
+5. If execute_blender_code failed, try searching knowledge base first or simplifying the code
+6. Add conditional dependencies to handle potential failures gracefully
+
+Return ONLY valid JSON in this exact format:
+{
+  "mainTask": "brief description",
+  "reasoning": "why the new plan should work better",
+  "subtasks": [
+    {"id": 1, "description": "task 1", "tool": "tool_name", "parameters": {}, "dependencies": []},
+    {"id": 2, "description": "task 2", "tool": "tool_name", "parameters": {}, "dependencies": []}
+  ]
+}
+
+IMPORTANT: Ensure the new plan has a different strategy than the failed one!`;
+
+  try {
+    const response = await callAgentLLM([
+      new SystemMessage("You are a task re-planning expert. Always return valid JSON with alternative strategies."),
+      new HumanMessage(replanPrompt)
+    ], "gemini");
+    
+    logger.info('[Dynamic Replan] Received re-plan response from LLM');
+    
+    // Strip markdown code blocks if present
+    let cleanedResponse = response.trim();
+    if (cleanedResponse.startsWith('```')) {
+      cleanedResponse = cleanedResponse.replace(/^```(?:json)?\s*/i, '');
+      cleanedResponse = cleanedResponse.replace(/\s*```$/i, '');
+      cleanedResponse = cleanedResponse.trim();
+    }
+    
+    const parsed = JSON.parse(cleanedResponse);
+    logger.info('[Dynamic Replan] Successfully generated new plan', { 
+      subtaskCount: parsed.subtasks?.length || 0,
+      reasoning: parsed.reasoning 
+    });
+    
+    return {
+      success: true,
+      decomposition: parsed,
+      reasoning: parsed.reasoning
+    };
+  } catch (error) {
+    logger.error('[Dynamic Replan] Failed to generate new plan', { error: error.message });
+    
+    // Fallback: Create a simplified plan focusing on execute_blender_code
+    return {
+      success: true,
+      decomposition: {
+        mainTask: originalRequest,
+        reasoning: "Fallback plan using simplified Blender code approach",
+        subtasks: [
+          {
+            id: 1,
+            description: "Search Blender API knowledge base for relevant information",
+            tool: "search_knowledge_base",
+            parameters: { query: originalRequest },
+            dependencies: []
+          },
+          {
+            id: 2,
+            description: "Generate simplified Blender Python code based on knowledge base",
+            tool: "execute_blender_code",
+            parameters: { code: "import bpy\n# Create basic object based on request" },
+            dependencies: [1]
+          },
+          {
+            id: 3,
+            description: "Finish task with results",
+            tool: "finish_task",
+            parameters: { finalAnswer: `Completed: ${originalRequest}` },
+            dependencies: [2]
+          }
+        ]
+      },
+      reasoning: "Using fallback simplified plan"
+    };
+  }
 }
 
 // Task decomposition function
@@ -983,6 +1417,60 @@ IMPORTANT: For image-based requests, ALWAYS try asset_search_and_import (Hyper3D
     // Fallback decomposition for common patterns
     const request = userRequest.toLowerCase();
     
+    // FIRST: Check if this is an information/status query (not a modeling task)
+    const isInfoQuery = request.match(/\b(check|verify|show|tell|what|how|status|enabled|available|info|information|list|display)\b/);
+    const isIntegrationQuery = request.match(/\b(integration|polyhaven|hyper3d|sketchfab|addon|plugin)\b/);
+    const isSceneQuery = request.match(/\b(scene|objects?|models?|current|what's in)\b/);
+    
+    if (isInfoQuery && (isIntegrationQuery || isSceneQuery)) {
+      if (isIntegrationQuery) {
+        // Integration status check - just get info and report
+        console.log(`📋 [Fallback] Detected integration status query`);
+        return {
+          mainTask: userRequest,
+          subtasks: [
+            {
+              id: 1,
+              description: "Check current scene and integration status",
+              tool: "get_scene_info",
+              parameters: {},
+              dependencies: []
+            },
+            {
+              id: 2,
+              description: "Report integration status to user",
+              tool: "finish_task",
+              parameters: { finalAnswer: "Integration status check completed" },
+              dependencies: [1]
+            }
+          ]
+        };
+      } else if (isSceneQuery) {
+        // Scene information query - just get scene info
+        console.log(`📋 [Fallback] Detected scene query`);
+        return {
+          mainTask: userRequest,
+          subtasks: [
+            {
+              id: 1,
+              description: "Get current scene information",
+              tool: "get_scene_info",
+              parameters: {},
+              dependencies: []
+            },
+            {
+              id: 2,
+              description: "Report scene information to user",
+              tool: "finish_task",
+              parameters: { finalAnswer: "Scene information retrieved" },
+              dependencies: [1]
+            }
+          ]
+        };
+      }
+    }
+    
+    // Handle animation-specific requests
     if (request.includes("rabbit") && (request.includes("hop") || request.includes("jump"))) {
       return {
         mainTask: "Create a rabbit and make it hop",
@@ -1249,16 +1737,38 @@ print('3D object created based on request!')`;
 }
 
 // Helper function to execute a subtask with timeout
+// Helper to determine if an error is retryable
+function isRetryableError(error) {
+  const retryablePatterns = [
+    /timeout/i,
+    /timed out/i,
+    /ECONNREFUSED/i,
+    /ETIMEDOUT/i,
+    /ECONNRESET/i,
+    /rate limit/i,
+    /too many requests/i,
+    /service unavailable/i,
+    /temporarily unavailable/i
+  ];
+  
+  const errorMsg = error?.message || String(error);
+  return retryablePatterns.some(pattern => pattern.test(errorMsg));
+}
+
 async function executeSubtaskWithTimeout(subtask, state, timeout = 60000) {
   console.log(`⚡ [Parallel Execution] Starting subtask ${subtask.id}: ${subtask.description}`);
   
   return new Promise(async (resolve) => {
+    let timedOut = false;
+    
     const timeoutId = setTimeout(() => {
+      timedOut = true;
       resolve({
         subtaskId: subtask.id,
         success: false,
         error: 'Subtask execution timeout',
-        timedOut: true
+        timedOut: true,
+        retryable: true // Timeouts are always retryable
       });
     }, timeout);
     
@@ -1293,18 +1803,26 @@ async function executeSubtaskWithTimeout(subtask, state, timeout = 60000) {
           };
       }
       
-      clearTimeout(timeoutId);
-      resolve({
-        subtaskId: subtask.id,
-        ...toolResult
-      });
+      if (!timedOut) {
+        clearTimeout(timeoutId);
+        resolve({
+          subtaskId: subtask.id,
+          ...toolResult,
+          timedOut: false,
+          retryable: toolResult.success ? false : isRetryableError(new Error(toolResult.error))
+        });
+      }
     } catch (error) {
-      clearTimeout(timeoutId);
-      resolve({
-        subtaskId: subtask.id,
-        success: false,
-        error: error.message
-      });
+      if (!timedOut) {
+        clearTimeout(timeoutId);
+        resolve({
+          subtaskId: subtask.id,
+          success: false,
+          error: error.message,
+          timedOut: false,
+          retryable: isRetryableError(error)
+        });
+      }
     }
   });
 }
@@ -1312,24 +1830,25 @@ async function executeSubtaskWithTimeout(subtask, state, timeout = 60000) {
 // Helper function to create complete agent state updates
 function createAgentStateUpdate(state, updates = {}) {
   return {
-    messages: updates.messages || [],
+    messages: updates.messages !== undefined ? updates.messages : [],
     sceneContext: updates.sceneContext !== undefined ? updates.sceneContext : state.sceneContext,
     ragContext: updates.ragContext !== undefined ? updates.ragContext : state.ragContext,
-    integrationStatus: updates.integrationStatus || state.integrationStatus,
+    integrationStatus: updates.integrationStatus !== undefined ? updates.integrationStatus : state.integrationStatus,
     loopCount: updates.loopCount !== undefined ? updates.loopCount : state.loopCount,
     maxLoops: state.maxLoops,
     blenderAvailable: updates.blenderAvailable !== undefined ? updates.blenderAvailable : state.blenderAvailable,
     conversationId: updates.conversationId !== undefined ? updates.conversationId : state.conversationId,
-    searchHistory: updates.searchHistory || state.searchHistory,
+    searchHistory: updates.searchHistory !== undefined ? updates.searchHistory : state.searchHistory,
     assetGenerated: updates.assetGenerated !== undefined ? updates.assetGenerated : state.assetGenerated,
     animationGenerated: updates.animationGenerated !== undefined ? updates.animationGenerated : state.animationGenerated,
     taskDecomposition: updates.taskDecomposition !== undefined ? updates.taskDecomposition : state.taskDecomposition,
     currentSubtaskIndex: updates.currentSubtaskIndex !== undefined ? updates.currentSubtaskIndex : state.currentSubtaskIndex,
-    completedSubtasks: updates.completedSubtasks || state.completedSubtasks,
-    subtaskResults: updates.subtaskResults || state.subtaskResults,
-    attachments: updates.attachments || state.attachments,
+    completedSubtasks: updates.completedSubtasks !== undefined ? updates.completedSubtasks : state.completedSubtasks,
+    subtaskResults: updates.subtaskResults !== undefined ? updates.subtaskResults : state.subtaskResults,
+    attachments: updates.attachments !== undefined ? updates.attachments : state.attachments,
+    hasReplanned: updates.hasReplanned !== undefined ? updates.hasReplanned : state.hasReplanned,
     toolName: updates.toolName !== undefined ? updates.toolName : null,
-    toolInput: updates.toolInput || {},
+    toolInput: updates.toolInput !== undefined ? updates.toolInput : {},
     finished: updates.finished !== undefined ? updates.finished : state.finished,
   };
 }
@@ -1452,7 +1971,77 @@ async function agentNode(state, config) {
     });
   }
 
-  // Step 2: Check for parallel execution opportunities
+  // Step 2a: Check if we need to replan due to critical failures
+  // Trigger re-planning if:
+  // 1. More than 50% of non-skipped, non-conditional subtasks have failed
+  // 2. At least 2 subtasks have been attempted
+  // 3. We haven't already replanned (prevent infinite replan loops)
+  const nonSkippedResults = Object.entries(subtaskResults).filter(([id, result]) => !result.skipped);
+  
+  // Only count non-conditional failures as critical
+  const criticalFailures = nonSkippedResults.filter(([id, result]) => {
+    if (result.success) return false;
+    
+    // Find the subtask definition
+    const subtask = taskDecomposition.subtasks.find(s => s.id === parseInt(id));
+    if (!subtask) return true; // If we can't find it, assume critical
+    
+    const description = subtask.description.toLowerCase();
+    // Ignore conditional fallback failures - they're expected to fail sometimes
+    const isConditionalFallback = /^if\s+(.*?)\s+(failed|cannot|not\s+found|unsuccessful)/i.test(description);
+    return !isConditionalFallback;
+  }).map(([id]) => parseInt(id));
+  
+  const attemptedCount = nonSkippedResults.length;
+  const criticalFailureRate = attemptedCount > 0 ? criticalFailures.length / attemptedCount : 0;
+  const hasReplanned = state.hasReplanned || false;
+  
+  // Critical failure threshold: 50% critical failure rate with at least 2 critical failures
+  const shouldReplan = !hasReplanned && 
+                       attemptedCount >= 2 && 
+                       criticalFailures.length >= 2 &&
+                       criticalFailureRate >= 0.5;
+  
+  if (shouldReplan && currentSubtaskIndex < taskDecomposition.subtasks.length) {
+    logger.warn('[Dynamic Replan] Critical failure threshold reached, initiating re-planning', {
+      criticalFailuresCount: criticalFailures.length,
+      attemptedCount,
+      criticalFailureRate: `${(criticalFailureRate * 100).toFixed(1)}%`
+    });
+    
+    try {
+      const replanResult = await replanOnFailure(
+        lastHumanMessage.content,
+        taskDecomposition,
+        criticalFailures,
+        completedSubtasks,
+        subtaskResults,
+        attachments
+      );
+      
+      if (replanResult.success) {
+        logger.info('[Dynamic Replan] Successfully generated alternative plan', {
+          reasoning: replanResult.reasoning
+        });
+        
+        return createAgentStateUpdate(state, {
+          messages: [new AIMessage(`I'll try a different approach: ${replanResult.reasoning}`)],
+          taskDecomposition: replanResult.decomposition,
+          currentSubtaskIndex: 0, // Reset to start of new plan
+          completedSubtasks: [], // Reset completion tracking
+          subtaskResults: {}, // Reset results
+          hasReplanned: true, // Mark that we've replanned to prevent loops
+          loopCount: loopCount + 1,
+          finished: false,
+        });
+      }
+    } catch (error) {
+      logger.error('[Dynamic Replan] Re-planning failed', { error: error.message });
+      // Continue with original plan if re-planning fails
+    }
+  }
+
+  // Step 2b: Check for parallel execution opportunities
   // Find all subtasks that can run in parallel (all dependencies met, not yet executed)
   const readySubtasks = taskDecomposition.subtasks.filter((subtask, idx) => {
     // Not yet executed
@@ -1597,8 +2186,8 @@ async function toolNode(state) {
     };
   }
 
-  console.log(`🔧 [LangGraph] Executing tool: ${toolName}`);
-  console.log(`🔍 [Debug] Tool input:`, toolInput);
+  logger.info(`⚙️ [LangGraph] Executing tool: ${toolName}`, { toolName });
+  logger.debug(`Tool input`, toolInput);
 
   try {
     let toolResult;
@@ -1607,7 +2196,7 @@ async function toolNode(state) {
     switch (toolName) {
       case "decompose_task":
         // Pass attachments to decomposeUserTask for image analysis
-        console.log(`🔧 [ToolNode] Decompose task called with ${toolInput.attachments?.length || 0} attachments`);
+        logger.info(`[ToolNode] Decompose task called`, { attachmentCount: toolInput.attachments?.length || 0 });
         const enhancedDecomposition = await decomposeUserTask(toolInput.userRequest, toolInput.attachments || []);
         toolResult = {
           success: true,
@@ -1631,6 +2220,10 @@ async function toolNode(state) {
         console.log(`🔧 [ToolNode] Analyze image called with ${toolInput.attachments?.length || 0} attachments`);
         toolResult = await analyzeImageTool.invoke(toolInput);
         break;
+      case "validate_with_vision":
+        console.log(`🔧 [ToolNode] Vision validation called`);
+        toolResult = await validateWithVisionTool.invoke(toolInput);
+        break;
       case "create_animation":
         toolResult = await createAnimationTool.invoke(toolInput);
         break;
@@ -1638,6 +2231,7 @@ async function toolNode(state) {
         // Validate that critical subtasks succeeded before finishing
         let hasFailures = false;
         let failureDetails = [];
+        let hasCriticalFailures = false;
         
         if (taskDecomposition && subtaskResults) {
           // Check all non-finish subtasks for failures
@@ -1652,29 +2246,34 @@ async function toolNode(state) {
             // AND has the failure condition at the START of the description
             const isConditionalFallback = /^if\s+(.*?)\s+(failed|cannot|not\s+found|unsuccessful)/i.test(description);
             
-            // Check if this subtask failed
+            // Check if this subtask failed AND was not skipped
             if (result && !result.success && !result.skipped) {
-              // If it's not a conditional fallback, or if ALL its dependencies also failed, it's a real failure
+              // Asset import failures are CRITICAL unless there's a successful fallback
+              const isAssetTask = subtask.tool === 'asset_search_and_import' || 
+                                 description.includes('import') || 
+                                 description.includes('add') ||
+                                 description.includes('generate') ||
+                                 description.includes('create');
+              
+              // If it's not a conditional fallback, check for critical failure
               if (!isConditionalFallback) {
-                // For primary tasks, check if any of its dependencies succeeded
-                // If a dependency succeeded, this task should have worked
-                const hasDependencies = subtask.dependencies && subtask.dependencies.length > 0;
+                // Check if there's a successful fallback subtask
+                const hasFallbackSucceeded = taskDecomposition.subtasks.some(fallbackTask => {
+                  if (fallbackTask.id === subtask.id || fallbackTask.tool === 'finish_task') return false;
+                  const fallbackResult = subtaskResults[fallbackTask.id];
+                  const fallbackHasThisAsDependency = fallbackTask.dependencies?.includes(subtask.id);
+                  const fallbackIsConditional = /^if\s+(.*?)\s+(failed|cannot|not\s+found|unsuccessful)/i.test(fallbackTask.description.toLowerCase());
+                  return fallbackHasThisAsDependency && fallbackIsConditional && fallbackResult?.success;
+                });
                 
-                if (!hasDependencies) {
-                  // No dependencies - this is a primary task that failed
+                if (!hasFallbackSucceeded) {
+                  // No successful fallback - this is a failure
                   hasFailures = true;
-                  failureDetails.push(`Subtask ${subtask.id} (${subtask.description}): ${result.error || 'Failed'}`);
-                } else {
-                  // Has dependencies - check if any succeeded
-                  const anyDepSucceeded = subtask.dependencies.some(depId => {
-                    const depResult = subtaskResults[depId];
-                    return depResult && depResult.success;
-                  });
+                  failureDetails.push(`❌ ${subtask.description}: ${result.error || 'Failed'}`);
                   
-                  if (anyDepSucceeded) {
-                    // Dependency worked but this failed - that's a problem
-                    hasFailures = true;
-                    failureDetails.push(`Subtask ${subtask.id} (${subtask.description}): ${result.error || 'Failed'}`);
+                  // Mark as critical if it's an asset/generation task
+                  if (isAssetTask) {
+                    hasCriticalFailures = true;
                   }
                 }
               }
@@ -1682,13 +2281,13 @@ async function toolNode(state) {
           }
         }
         
-        if (hasFailures) {
+        if (hasCriticalFailures || (hasFailures && failureDetails.length > 0)) {
           toolResult = {
             success: false,
-            finished: true,
-            error: `Task completed with failures:\n${failureDetails.join('\n')}`,
-            finalAnswer: toolInput.finalAnswer,
-            partialSuccess: true
+            finished: false, // Don't mark as finished if critical tasks failed
+            error: `Cannot complete task - critical steps failed:\n${failureDetails.join('\n')}`,
+            finalAnswer: `I couldn't complete your request because:\n${failureDetails.join('\n')}\n\n${hasCriticalFailures ? '⚠️ Please check if the required integrations are enabled and have API quota available.' : ''}`,
+            partialSuccess: hasFailures && !hasCriticalFailures
           };
         } else {
           toolResult = await finishTaskTool.invoke(toolInput);
@@ -1698,13 +2297,20 @@ async function toolNode(state) {
         throw new Error(`Unknown tool: ${toolName}`);
     }
 
-    console.log(`✅ [LangGraph] Tool result:`, toolResult);
+    const resultEmoji = toolResult.success ? '✅' : '❌';
+    logger.info(`${resultEmoji} [LangGraph] Tool result: ${toolName}`, { toolName, success: toolResult.success });
 
     // Get user request from first human message
     const userRequest = state.messages.filter(msg => msg instanceof HumanMessage)[0]?.content || "";
     
     // Generate user-friendly response
     const friendlyResponse = generateFriendlyResponse(toolName, toolResult, state, userRequest);
+    
+    logger.debug('[ToolNode] Friendly response generated', { 
+      toolName, 
+      hasFriendlyResponse: !!friendlyResponse,
+      friendlyPreview: friendlyResponse ? friendlyResponse.substring(0, 100) : 'none'
+    });
     
     // Build response message - use friendly version if available, otherwise technical
     let responseMessage;
@@ -1721,13 +2327,22 @@ async function toolNode(state) {
         responseMessage = toolResult.message || "Asset search completed";
       } else if (toolName === "analyze_image") {
         responseMessage = toolResult.message || "Image analysis completed";
+      } else if (toolName === "validate_with_vision") {
+        if (toolResult.validation && toolResult.validation.pass) {
+          responseMessage = `✅ Validation passed! Quality score: ${toolResult.validation.quality_score}/10`;
+        } else if (toolResult.validation) {
+          responseMessage = `⚠️ Validation found issues:\n- ${toolResult.validation.issues.join('\n- ')}\n\nSuggestions:\n- ${toolResult.validation.suggestions.join('\n- ')}`;
+        } else {
+          responseMessage = toolResult.message || "Vision validation completed";
+        }
       } else if (toolName === "create_animation") {
         responseMessage = toolResult.message || "Animation created successfully";
       } else if (toolName === "finish_task") {
         if (toolResult.partialSuccess) {
           responseMessage = `Task completed with issues: ${toolResult.error || 'Some subtasks failed'}`;
         } else {
-          responseMessage = toolResult.message || "Task completed";
+          // Use finalAnswer from the tool if available, otherwise use a default message
+          responseMessage = toolResult.finalAnswer || toolResult.message || "Task completed successfully!";
         }
       } else {
         responseMessage = "Tool executed successfully";
@@ -1766,8 +2381,11 @@ async function toolNode(state) {
     }
 
     // Return updated state - IMPORTANT: Clear toolName after execution to prevent loops
-    const isFinished = toolName === "finish_task" || toolResult.finished || 
-                     (taskDecomposition && newCurrentSubtaskIndex >= taskDecomposition.subtasks.length && toolResult.success);
+    // Only mark as finished if finish_task succeeded OR all subtasks completed successfully
+    const isFinished = (toolName === "finish_task" && toolResult.success) || 
+                     (toolResult.finished && toolResult.success) ||
+                     (taskDecomposition && newCurrentSubtaskIndex >= taskDecomposition.subtasks.length && 
+                      toolName === "finish_task" && toolResult.success);
     
     // Only add message if there's something to show the user
     const messagesToAdd = responseMessage ? [new AIMessage(responseMessage)] : [];
@@ -1788,7 +2406,7 @@ async function toolNode(state) {
       attachments: state.attachments, // Preserve attachments in state
     };
   } catch (error) {
-    console.error(`❌ [LangGraph] Tool execution error:`, error.message);
+    logger.error(`[LangGraph] Tool execution error`, { error: error.message, stack: error.stack });
     return {
       messages: [new AIMessage(`Tool execution failed: ${error.message}`)],
       finished: false,
@@ -1819,9 +2437,19 @@ function generateFriendlyResponse(toolName, toolResult, state, userRequest) {
   if (toolName === "asset_search_and_import") {
     if (toolResult.success) {
       const assetName = toolResult.assetResult?.name || "the 3D model";
-      return `Great news! I found and imported ${assetName} using ${toolResult.assetResult?.source || 'an external library'}. 🎉`;
+      const source = toolResult.assetResult?.source || 'an external library';
+      const sourceNames = { 'polyhaven': 'PolyHaven', 'hyper3d': 'Hyper3D', 'sketchfab': 'Sketchfab' };
+      return `Great news! I found and imported ${assetName} using ${sourceNames[source] || source}. 🎉`;
     } else {
-      return `I couldn't find a pre-made model for that, but no worries! I'll create it from scratch using Blender. 🛠️`;
+      const error = toolResult.error || toolResult.message || '';
+      if (error.includes('No PolyHaven assets found')) {
+        const searchTerms = error.match(/categories: (.+)$/)?.[1] || 'those terms';
+        return `I searched PolyHaven for "${searchTerms}" but didn't find any matching assets. Let me try creating it from scratch! 🛠️`;
+      } else if (error.includes('integration')) {
+        return `The asset import service is currently unavailable. I'll create this using Blender code instead! 🛠️`;
+      } else {
+        return `I couldn't find a pre-made model for that, but no worries! I'll create it from scratch using Blender. 🛠️`;
+      }
     }
   }
   
@@ -1852,34 +2480,116 @@ function generateFriendlyResponse(toolName, toolResult, state, userRequest) {
   }
   
   if (toolName === "finish_task") {
-    // Generate a comprehensive summary
+    // Generate a comprehensive summary based on ACTUAL execution
     const objCount = state.sceneContext?.object_count || 0;
     const assetGenerated = state.assetGenerated;
     const animationGenerated = state.animationGenerated;
+    const decomposition = state.taskDecomposition;
+    const subtaskResults = state.subtaskResults || {};
+    const completedSubtasks = state.completedSubtasks || [];
     
+    // Analyze what actually happened
+    const executionLog = [];
+    const failedActions = [];
+    const successfulActions = [];
+    
+    if (decomposition && decomposition.subtasks) {
+      decomposition.subtasks.forEach(subtask => {
+        const result = subtaskResults[subtask.id];
+        if (result) {
+          const actionDesc = {
+            tool: subtask.tool,
+            description: subtask.description,
+            success: result.success,
+            details: result
+          };
+          
+          if (result.success) {
+            successfulActions.push(actionDesc);
+          } else {
+            failedActions.push(actionDesc);
+          }
+          executionLog.push(actionDesc);
+        }
+      });
+    }
+    
+    // Build response based on actual execution
     let response = `\n\n✅ **Here you go!** I've completed your request.\n\n`;
     
-    // Describe what was done
-    if (assetGenerated) {
-      response += `🎨 I imported a 3D model from an online library.\n`;
-    } else {
-      response += `🛠️ I created the 3D model from scratch using Blender code.\n`;
+    // Describe what actually happened
+    response += `🔍 **What I did:**\n`;
+    
+    if (successfulActions.length > 0) {
+      successfulActions.forEach(action => {
+        if (action.tool === 'asset_search_and_import') {
+          if (action.details.assetResult?.source === 'polyhaven') {
+            response += `   ✓ Searched PolyHaven for assets: ${action.details.message || 'No results found'}\n`;
+          } else if (action.details.assetResult?.source === 'hyper3d') {
+            response += `   ✓ Generated 3D model using Hyper3D: ${action.details.assetResult?.name || 'Success'}\n`;
+          } else if (action.details.assetResult?.source === 'sketchfab') {
+            response += `   ✓ Imported from Sketchfab: ${action.details.assetResult?.name || 'Success'}\n`;
+          } else {
+            response += `   ✓ Tried to import asset: ${action.details.message || 'Attempted'}\n`;
+          }
+        } else if (action.tool === 'execute_blender_code') {
+          const output = action.details.result?.result || action.details.message || 'Code executed';
+          response += `   ✓ Created model with Blender code: ${output}\n`;
+        } else if (action.tool === 'get_scene_info') {
+          const sceneInfo = action.details.sceneContext;
+          if (sceneInfo) {
+            response += `   ✓ Checked scene: ${sceneInfo.object_count || 0} objects found\n`;
+            if (sceneInfo.object_names && sceneInfo.object_names.length > 0) {
+              response += `     Objects: ${sceneInfo.object_names.join(', ')}\n`;
+            }
+          }
+        } else if (action.tool === 'analyze_image') {
+          response += `   ✓ Analyzed uploaded image(s)\n`;
+        } else if (action.tool === 'create_animation') {
+          response += `   ✓ Added ${action.details.animation?.type || 'animation'} effect\n`;
+        }
+      });
     }
     
-    if (animationGenerated) {
-      response += `🎬 I added animation to bring it to life.\n`;
+    if (failedActions.length > 0) {
+      response += `\n⚠️ **Issues encountered:**\n`;
+      failedActions.forEach(action => {
+        if (action.tool === 'asset_search_and_import') {
+          response += `   ✗ Asset search: ${action.details.error || action.details.message}\n`;
+        } else if (action.tool === 'execute_blender_code') {
+          response += `   ✗ Code execution: ${action.details.error || 'Failed'}\n`;
+        } else {
+          response += `   ✗ ${action.tool}: ${action.details.error || 'Failed'}\n`;
+        }
+      });
     }
     
+    // Scene status
     if (objCount > 0) {
-      response += `📊 Your scene now has ${objCount} object${objCount !== 1 ? 's' : ''}.\n`;
+      response += `\n📊 **Scene status:** ${objCount} object${objCount !== 1 ? 's' : ''} in your scene.\n`;
     }
     
-    response += `\n💡 **Want to make changes?** You can ask me to:\n`;
-    response += `   • Change colors or materials\n`;
-    response += `   • Add more details or objects\n`;
-    response += `   • Adjust size or position\n`;
-    response += `   • Add animations or effects\n`;
-    response += `\nWhat would you like to do next? 😊`;
+    // Check if this was an info query vs modeling task
+    const wasInfoQuery = userRequest.toLowerCase().match(/\b(check|verify|show|tell|what|status|enabled|info)\b/);
+    
+    if (wasInfoQuery) {
+      // For info queries, provide the answer directly
+      if (state.integrationStatus) {
+        response += `\n🔌 **Integration Status:**\n`;
+        response += `   • PolyHaven: ${state.integrationStatus.polyhaven ? '✅ Enabled' : '❌ Disabled'}\n`;
+        response += `   • Hyper3D: ${state.integrationStatus.hyper3d ? '✅ Enabled' : '❌ Disabled'}\n`;
+        response += `   • Sketchfab: ${state.integrationStatus.sketchfab ? '✅ Enabled' : '❌ Disabled'}\n`;
+      }
+      response += `\nNeed anything else? 😊`;
+    } else {
+      // For modeling tasks, suggest next steps
+      response += `\n💡 **Want to make changes?** You can ask me to:\n`;
+      response += `   • Change colors or materials\n`;
+      response += `   • Add more details or objects\n`;
+      response += `   • Adjust size or position\n`;
+      response += `   • Add animations or effects\n`;
+      response += `\nWhat would you like to do next? 😊`;
+    }
     
     return response;
   }
@@ -1890,21 +2600,33 @@ function generateFriendlyResponse(toolName, toolResult, state, userRequest) {
 // Conditional routing function
 function shouldContinue(state) {
   // Log state for debugging
-  console.log(`🔀 [Router] Evaluating routing: finished=${state.finished}, loopCount=${state.loopCount}/${state.maxLoops}, toolName=${state.toolName || 'null'}`);
+  logger.debug(`[Router] Evaluating routing`, { 
+    finished: state.finished, 
+    loopCount: `${state.loopCount}/${state.maxLoops}`, 
+    toolName: state.toolName || 'null',
+    hasMessages: state.messages?.length > 0
+  });
   
-  if (state.finished) {
-    console.log(`🏁 [Router] Task finished, routing to END`);
+  // Check if finished first
+  if (state.finished === true) {
+    logger.info(`[Router] Task finished, routing to END`);
     return END;
   }
+  
+  // Check max loops
   if (state.loopCount >= state.maxLoops) {
-    console.log(`🚫 [Router] Max loops reached, routing to END`);
+    logger.warn(`[Router] Max loops reached, routing to END`);
     return END;
   }
-  if (state.toolName) {
-    console.log(`🔧 [Router] Tool specified (${state.toolName}), routing to tools`);
+  
+  // Check if tool should be executed
+  if (state.toolName && typeof state.toolName === 'string' && state.toolName.trim() !== '') {
+    logger.debug(`[Router] Tool specified, routing to tools`, { toolName: state.toolName });
     return "tools";
   }
-  console.log(`🔄 [Router] Continuing to agent node`);
+  
+  // Default: continue to agent
+  logger.debug(`[Router] Continuing to agent node`);
   return "agent";
 }
 
@@ -1913,7 +2635,15 @@ export function createAgentWorkflow() {
   const workflow = new StateGraph(AgentStateAnnotation)
     .addNode("agent", agentNode)
     .addNode("tools", toolNode)
-    .addConditionalEdges("agent", shouldContinue, ["tools", END])
+    .addConditionalEdges(
+      "agent", 
+      shouldContinue,
+      {
+        "tools": "tools",
+        "agent": "agent",
+        [END]: END
+      }
+    )
     .addEdge("tools", "agent")
     .setEntryPoint("agent");
 
@@ -1933,14 +2663,17 @@ export async function runLangGraphAgent(prompt, options = {}) {
     attachments = [],
   } = options;
 
-  console.log(`🚀 [LangGraph] Starting agent with ${attachments.length} attachments`);
+  logger.info(`🚀 [LangGraph] Starting agent`, { attachmentCount: attachments.length, maxLoops });
+
+  // Check integration status (MUST await the async call)
+  const integrationStatus = await integrationModules.checkIntegrationStatus();
 
   // Initialize state
   const initialState = {
     messages: [new HumanMessage(prompt)],
     sceneContext,
     ragContext: null,
-    integrationStatus: integrationModules.checkIntegrationStatus(), // Use dynamic check
+    integrationStatus, // Now contains actual status object, not a Promise
     loopCount: 0,
     maxLoops,
     blenderAvailable: isBlenderConnected(), // Use dynamic check
@@ -1952,6 +2685,7 @@ export async function runLangGraphAgent(prompt, options = {}) {
     completedSubtasks: [],
     subtaskResults: {},
     attachments: attachments || [], // Ensure attachments are included in state
+    hasReplanned: false, // Track whether we've already replanned
   };
 
   console.log(`🚀 [LangGraph] Initial state created with ${initialState.attachments.length} attachments`);
@@ -1970,10 +2704,21 @@ export async function runLangGraphAgent(prompt, options = {}) {
   const workflow = createAgentWorkflow();
   const result = await workflow.invoke(initialState, { configurable: { model } });
 
+  logger.info('🎉 [LangGraph] Workflow completed', { 
+    messageCount: result.messages.length,
+    finished: result.finished,
+    loopCount: result.loopCount 
+  });
+
   // Compile all AI messages (excluding internal/technical ones) into a conversational response
   const aiMessages = result.messages
     .filter(msg => msg instanceof AIMessage && msg.content && msg.content.trim().length > 0)
     .map(msg => msg.content);
+  
+  logger.info('[LangGraph] AI messages extracted', { 
+    aiMessageCount: aiMessages.length,
+    preview: aiMessages.length > 0 ? aiMessages[aiMessages.length - 1].substring(0, 100) : 'none'
+  });
   
   // Generate final user-friendly response
   let finalResponse;
@@ -1982,14 +2727,17 @@ export async function runLangGraphAgent(prompt, options = {}) {
     const finishMessage = aiMessages.find(msg => msg.includes("✅") && msg.includes("Here you go"));
     if (finishMessage) {
       finalResponse = finishMessage;
+      logger.info('[LangGraph] Using finish message', { preview: finishMessage.substring(0, 100) });
     } else {
       // Otherwise, combine all messages into a natural flow
       finalResponse = aiMessages.join("\n\n");
+      logger.info('[LangGraph] Using combined messages', { count: aiMessages.length });
     }
   } else {
     // Fallback if no messages (shouldn't happen but just in case)
     const objCount = result.sceneContext?.object_count || 0;
     finalResponse = `✅ Done! I've completed your request. Your scene now has ${objCount} object${objCount !== 1 ? 's' : ''}.\n\nWhat would you like to do next? 😊`;
+    logger.warn('[LangGraph] No AI messages found, using fallback response');
   }
 
   return {

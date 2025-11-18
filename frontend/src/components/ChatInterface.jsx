@@ -15,6 +15,7 @@ import {
 
 
 const ATTACHMENT_CACHE_KEY = "cursorfor3d:attachment-cache";
+const MESSAGE_ATTACHMENT_CACHE_KEY = "cursorfor3d:message-attachment-cache";
 
 const ChatInterface = () => {
   const { token, user, logout, apiBase } = useAuth();
@@ -61,6 +62,7 @@ const ChatInterface = () => {
   const [editingChatId, setEditingChatId] = useState(null);
   const [editedName, setEditedName] = useState("");
   const attachmentsCacheRef = useRef(new Map());
+  const messageAttachmentCacheRef = useRef(new Map());
   const [editingMessage, setEditingMessage] = useState(null);
 
   const persistAttachmentDataUrl = useCallback((id, dataUrl) => {
@@ -97,6 +99,64 @@ const ChatInterface = () => {
     loadAttachmentCacheFromStorage();
   }, [loadAttachmentCacheFromStorage]);
 
+  const persistMessageAttachments = useCallback((messageId, attachmentsList) => {
+    if (!messageId || typeof window === "undefined") return;
+    if (!Array.isArray(attachmentsList) || attachmentsList.length === 0) return;
+
+    const sanitized = attachmentsList
+      .filter((att) => att && att.dataUrl)
+      .map((att) => ({
+        id: att.id,
+        name: att.name,
+        type: att.type,
+        size: att.size,
+        dataUrl: att.dataUrl,
+      }));
+
+    if (sanitized.length === 0) return;
+
+    messageAttachmentCacheRef.current.set(messageId, sanitized);
+    try {
+      const raw = window.localStorage.getItem(MESSAGE_ATTACHMENT_CACHE_KEY);
+      const cache = raw ? JSON.parse(raw) : {};
+      cache[messageId] = sanitized;
+      window.localStorage.setItem(MESSAGE_ATTACHMENT_CACHE_KEY, JSON.stringify(cache));
+    } catch (err) {
+      console.warn("Failed to persist message attachments", err);
+    }
+  }, []);
+
+  const loadMessageAttachmentCacheFromStorage = useCallback(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const raw = window.localStorage.getItem(MESSAGE_ATTACHMENT_CACHE_KEY);
+      if (!raw) return;
+      const cache = JSON.parse(raw);
+      if (!cache || typeof cache !== "object") return;
+      Object.entries(cache).forEach(([messageId, attachments]) => {
+        if (!Array.isArray(attachments)) return;
+        const sanitized = attachments
+          .filter((att) => att && typeof att.dataUrl === "string" && att.dataUrl.startsWith("data:"))
+          .map((att) => ({
+            id: att.id,
+            name: att.name,
+            type: att.type,
+            size: att.size,
+            dataUrl: att.dataUrl,
+          }));
+        if (sanitized.length > 0) {
+          messageAttachmentCacheRef.current.set(messageId, sanitized);
+        }
+      });
+    } catch (err) {
+      console.warn("Failed to load message attachment cache", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadMessageAttachmentCacheFromStorage();
+  }, [loadMessageAttachmentCacheFromStorage]);
+
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, []);
@@ -106,17 +166,8 @@ const ChatInterface = () => {
   }, [messages, scrollToBottom]);
 
   const normalizeMessage = useCallback(
-    (message) => ({
-      id: message.id,
-      role: message.role,
-      content: message.content || "",
-      timestamp: message.createdAt || message.created_at || new Date().toISOString(),
-      provider: message.provider || message.metadata?.model || null,
-      blenderResult: message.blenderResult || message.blender_result || null,
-      sceneContext: message.sceneContext || message.scene_context || null,
-      enhancedPrompt: message.metadata?.enhancedPrompt || null,
-      metadata: message.metadata || {},
-      attachments: (message.metadata?.attachments || message.attachments || []).map((att) => {
+    (message) => {
+      const baseAttachments = (message.metadata?.attachments || message.attachments || []).map((att) => {
         const cachedDataUrl = attachmentsCacheRef.current.get(att.id);
         const dataUrl = cachedDataUrl || att.dataUrl || null;
         if (!cachedDataUrl && att.dataUrl) {
@@ -126,9 +177,44 @@ const ChatInterface = () => {
           ...att,
           dataUrl,
         };
-      }),
-    }),
-    [persistAttachmentDataUrl]
+      });
+
+      let finalizedAttachments = baseAttachments;
+
+      if ((!finalizedAttachments || finalizedAttachments.length === 0) && message.role === "user") {
+        const cached = messageAttachmentCacheRef.current.get(message.id);
+        if (cached && cached.length > 0) {
+          finalizedAttachments = cached.map((att) => {
+            const cachedDataUrl = att.dataUrl || attachmentsCacheRef.current.get(att.id) || null;
+            if (cachedDataUrl) {
+              persistAttachmentDataUrl(att.id, cachedDataUrl);
+            }
+            return {
+              ...att,
+              dataUrl: cachedDataUrl,
+            };
+          });
+        }
+      }
+
+      if (message.role === "user" && finalizedAttachments && finalizedAttachments.length > 0) {
+        persistMessageAttachments(message.id, finalizedAttachments);
+      }
+
+      return {
+        id: message.id,
+        role: message.role,
+        content: message.content || "",
+        timestamp: message.createdAt || message.created_at || new Date().toISOString(),
+        provider: message.provider || message.metadata?.model || null,
+        blenderResult: message.blenderResult || message.blender_result || null,
+        sceneContext: message.sceneContext || message.scene_context || null,
+        enhancedPrompt: message.metadata?.enhancedPrompt || null,
+        metadata: message.metadata || {},
+        attachments: finalizedAttachments,
+      };
+    },
+    [persistAttachmentDataUrl, persistMessageAttachments]
   );
 
   const authorizedFetch = useCallback(
@@ -404,17 +490,23 @@ const ChatInterface = () => {
       return;
     }
 
+    const attachmentsAtSend = attachments.map((att) => ({ ...att }));
+
     const tempMessage = {
       id: `temp-${Date.now()}`,
       role: "user",
       content: effectivePrompt,
       timestamp: new Date().toISOString(),
-      attachments: attachments.map((att) => ({
+      attachments: attachmentsAtSend.map((att) => ({
         ...att,
       })),
     };
     setMessages((prev) => [...prev, tempMessage]);
     setLoading(true);
+    
+    // Clear input and attachments immediately after sending
+    setInput("");
+    setAttachments([]);
 
     setProgress([]);
 
@@ -428,7 +520,7 @@ const ChatInterface = () => {
       let finalPrompt = effectivePrompt;
 
       // Verify attachments have dataUrl before sending
-      const payloadAttachments = attachments.map(({ id, name, type, dataUrl, size }) => {
+      const payloadAttachments = attachmentsAtSend.map(({ id, name, type, dataUrl, size }) => {
         if (!dataUrl) {
           console.warn('⚠️ Attachment missing dataUrl:', name);
         }
@@ -526,8 +618,11 @@ const ChatInterface = () => {
       }
       
       setError(userFriendlyError);
-      // Restore the original input so user can try again
+      // Restore the original input and attachments so user can try again
       setInput(originalInputValue);
+      if (attachmentsAtSend.length > 0) {
+        setAttachments(attachmentsAtSend);
+      }
       setMessages((prev) => [
         ...prev.filter((msg) => !String(msg.id).startsWith("temp-")),
         {
@@ -553,6 +648,7 @@ const ChatInterface = () => {
     loading,
     normalizeMessage,
     persistAttachmentDataUrl,
+    persistMessageAttachments,
     selectedModel,
   ]);
 

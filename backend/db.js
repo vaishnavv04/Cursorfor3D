@@ -199,6 +199,20 @@ async function initSchema() {
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages (conversation_id, created_at ASC);"
     );
+
+    // API usage / cost tracking
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS api_usage (
+        id bigserial PRIMARY KEY,
+        user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+        provider TEXT,
+        model TEXT,
+        usage JSONB,
+        cost_usd NUMERIC,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+    await client.query("CREATE INDEX IF NOT EXISTS idx_api_usage_user ON api_usage (user_id, created_at DESC);");
   } finally {
     if (client) {
       client.release();
@@ -222,4 +236,110 @@ async function checkDatabaseHealth() {
   }
 }
 
-export { pool, initSchema, mapConversation, mapMessage, checkDatabaseHealth };
+/**
+ * Insert API usage record
+ * @param {Object} params - Usage parameters
+ * @param {string|null} params.userId - User ID (optional)
+ * @param {string|null} params.provider - Provider name (e.g., 'openai', 'google')
+ * @param {string|null} params.model - Model name
+ * @param {Object} params.usage - Token usage data
+ * @param {number|null} params.costUsd - Cost in USD (auto-calculated if not provided)
+ * @returns {Promise<Object|null>} Inserted record with id and created_at
+ */
+async function insertApiUsage({ userId = null, provider = null, model = null, usage = {}, costUsd = null }) {
+  const client = await pool.connect();
+  try {
+    // If costUsd wasn't provided, compute it using token counts and configured rates
+    let finalCost = costUsd;
+    if (finalCost == null) {
+      try {
+        // Determine token count from usage object
+        const u = usage || {};
+        const totalTokens = Number(u.total_tokens ?? ((u.prompt_tokens ?? 0) + (u.completion_tokens ?? 0)) ?? 0) || 0;
+
+        // Load rate map from env if provided, otherwise use built-in defaults (USD per 1000 tokens)
+        // Expected env format: JSON string, e.g. { "openai": { "gpt-4o": 0.06, "default": 0.03 }, "default": 0.02 }
+        const rawRates = process.env.API_USAGE_RATES || null;
+        let rates = {
+          // USD per 1000 tokens sensible defaults (very small estimates)
+          default: Number(process.env.RATE_PER_1K_USD ?? 0.02),
+          openai: { default: Number(process.env.RATE_OPENAI_PER_1K_USD ?? 0.03) },
+          google: { default: Number(process.env.RATE_GOOGLE_PER_1K_USD ?? 0.015) },
+        };
+
+        if (rawRates) {
+          try {
+            const parsed = JSON.parse(rawRates);
+            rates = Object.assign(rates, parsed);
+          } catch (e) {
+            console.warn('[db] Failed to parse API_USAGE_RATES env, using defaults:', e?.message || e);
+          }
+        }
+
+        // Helper to resolve rate for a provider+model
+        function resolveRate(providerName, modelName) {
+          if (!providerName) return rates.default || 0;
+          const p = rates[providerName.toLowerCase()] || rates[providerName] || null;
+          if (!p) return rates.default || 0;
+          if (modelName && typeof p === 'object' && (p[modelName] || p[modelName.toLowerCase()])) {
+            return p[modelName] ?? p[modelName.toLowerCase()] ?? p.default ?? rates.default ?? 0;
+          }
+          if (typeof p === 'number') return p;
+          return p.default ?? rates.default ?? 0;
+        }
+
+        const per1k = resolveRate(provider ? provider.toString() : null, model ? model.toString() : null);
+        finalCost = Number(((totalTokens / 1000) * per1k).toFixed(6));
+      } catch (e) {
+        console.warn('[db] Failed to compute cost from usage:', e?.message || e);
+        finalCost = null;
+      }
+    }
+
+    const { rows } = await client.query(
+      `INSERT INTO api_usage (user_id, provider, model, usage, cost_usd) VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
+      [userId, provider, model, usage ? usage : {}, finalCost]
+    );
+    return rows[0];
+  } catch (err) {
+    console.error('Failed to insert API usage:', err.message || err);
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Get usage summary for a user
+ * @param {Object} params - Query parameters
+ * @param {string|null} params.userId - User ID to filter by (optional)
+ * @param {number} params.sinceDays - Number of days to look back (default: 30)
+ * @returns {Promise<Array>} Usage summary grouped by provider and model
+ */
+async function getUsageSummary({ userId = null, sinceDays = 30 } = {}) {
+  const client = await pool.connect();
+  try {
+    const since = new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000).toISOString();
+    const params = [];
+    let whereClauses = [];
+    if (userId) {
+      params.push(userId);
+      whereClauses.push(`user_id = $${params.length}`);
+    }
+    // created_at will be last param
+    params.push(since);
+    whereClauses.push(`created_at >= $${params.length}`);
+
+    const where = `WHERE ${whereClauses.join(' AND ')}`;
+    const query = `SELECT provider, model, SUM((usage->>'total_tokens')::bigint) AS total_tokens, SUM(cost_usd::numeric) AS total_cost, COUNT(1) AS calls FROM api_usage ${where} GROUP BY provider, model`;
+    const { rows } = await client.query(query, params);
+    return rows;
+  } catch (err) {
+    console.error('Failed to get usage summary:', err.message || err);
+    return [];
+  } finally {
+    client.release();
+  }
+}
+
+export { pool, initSchema, mapConversation, mapMessage, checkDatabaseHealth, insertApiUsage, getUsageSummary };

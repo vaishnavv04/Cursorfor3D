@@ -13,6 +13,7 @@ import * as hyper3d from './hyper3d.js';
 import * as sketchfab from './sketchfab.js';
 import * as polyhaven from './polyhaven.js';
 import { createCircuitBreaker } from './circuit-breaker.js';
+import logger from '../utils/logger.js';
 
 // Default TCP connection settings
 const PORT = parseInt(process.env.BLENDER_TCP_PORT || "9876", 10);
@@ -40,21 +41,40 @@ const polyhavenCircuitBreaker = createCircuitBreaker({ threshold: 3, timeout: 30
 export function initBlenderConnection() {
   return new Promise((resolve, reject) => {
     if (client && isConnected) {
-        console.log("Blender connection already active.");
+        logger.info("Blender connection already active");
         return resolve();
     }
+    
+    let resolved = false;
     
     try {
       client = new net.Socket();
       
       // Setup event handlers
       client.on('data', handleData);
-      client.on('error', handleError);
-      client.on('close', handleClose);
+      client.on('error', (err) => {
+        handleError(err);
+        // Reject only once
+        if (!resolved) {
+          resolved = true;
+          reject(err);
+        }
+      });
+      client.on('close', () => {
+        handleClose();
+        // Only reject if not already resolved/rejected
+        if (!resolved) {
+          resolved = true;
+          reject(new Error("Connection closed before establishing"));
+        }
+      });
       client.on('connect', () => {
         isConnected = true;
-        console.log(`🚀 Connected to Blender TCP server on ${HOST}:${PORT}`);
-        resolve();
+        logger.info(`Connected to Blender TCP server`, { host: HOST, port: PORT });
+        if (!resolved) {
+          resolved = true;
+          resolve();
+        }
       });
       
       // Initiate connection
@@ -63,7 +83,10 @@ export function initBlenderConnection() {
       });
 
     } catch (err) {
-      reject(err);
+      if (!resolved) {
+        resolved = true;
+        reject(err);
+      }
     }
   });
 }
@@ -75,7 +98,7 @@ function handleData(chunk) {
 }
 
 function handleError(err) {
-  console.error('❌ Blender Connection Error:', err.message);
+  logger.error('Blender Connection Error', { error: err.message });
   isConnected = false;
   if (pendingRequest) {
     try { pendingRequest.reject(err); } catch(e) {}
@@ -88,7 +111,7 @@ function handleError(err) {
 }
 
 function handleClose() {
-  console.log('🔌 Blender Connection closed.');
+  logger.info('Blender Connection closed');
   isConnected = false;
   handleError(new Error("Connection closed"));
 }
@@ -209,17 +232,18 @@ function enqueueCommand(commandType, params, resolve, reject) {
  * Process the command queue one at a time
  */
 async function processCommandQueue() {
-  if (isProcessingQueue || commandQueue.length === 0) {
-    return;
-  }
-  
-  // Check if a request is already pending a response
-  if (pendingRequest) {
+  // Single atomic check and lock - prevents race condition
+  if (isProcessingQueue || commandQueue.length === 0 || pendingRequest) {
     return;
   }
   
   isProcessingQueue = true;
   const command = commandQueue.shift();
+  
+  if (!command) {
+    isProcessingQueue = false;
+    return;
+  }
   
   try {
     const timeout = setTimeout(() => {

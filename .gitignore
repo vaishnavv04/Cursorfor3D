@@ -128,3 +128,15 @@ venv-mcp/
 # AI agent instructions (generated, not source)
 .github/copilot-instructions.md
 .github
+
+# Standalone test/debug files (not part of main app)
+backend/check_int_st.js
+backend/manual_gen.js
+backend/sketchfab.js
+
+# Documentation files (optional - uncomment to ignore)
+BUGFIX_SUMMARY.md
+CONVERSATIONAL_UX_IMPROVEMENTS.md
+VISION_VALIDATION_IMPLEMENTATION.md
+VISION_VALIDATION_TESTING.md
+LANGGRAPH_README.md

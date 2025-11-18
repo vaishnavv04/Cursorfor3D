@@ -55,11 +55,9 @@ export class CircuitBreaker {
         this.successCount = 0;
         console.log('✅ Circuit breaker: Moving to CLOSED state (service recovered)');
       }
-    } else if (this.state === 'OPEN') {
-      // This shouldn't happen, but handle it
-      this.state = 'CLOSED';
-      this.failureCount = 0;
     }
+    // Note: Success in CLOSED state just resets failure count (already done above)
+    // OPEN state cannot reach here as execute() blocks it
   }
 
   /**
