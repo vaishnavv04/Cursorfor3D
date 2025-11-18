@@ -711,20 +711,27 @@ User's original prompt: "${userPrompt}"
 ${conversationHistory.length > 0 ? `Conversation context:\n${conversationHistory.slice(-3).map((msg, i) => `${i + 1}. ${msg.role}: ${msg.content}`).join("\n")}\n` : ""}
 Enhanced prompt:
 `;
+
   try {
-    if (groqClient) {
-      const groqResponse = await groqClient.chat.completions.create({
-        model: PROMPT_ENHANCER_MODEL,
-        messages: [{ role: "user", content: enhancementPrompt }],
-        temperature: 0.3,
-      });
-      const enhanced = (groqResponse?.choices?.[0]?.message?.content || "").trim();
-      return enhanced || userPrompt;
-    }
+    const genAI = await createGeminiClient();
+    if (!genAI) throw new Error("Gemini API not configured");
+
+    const model = genAI.getGenerativeModel({
+      model: "gemini-2.5-flash-lite", // Switching here!
+      generationConfig: { temperature: 0.3 }
+    });
+
+    const response = await model.generateContent({
+      contents: [{ role: "user", parts: [{ text: enhancementPrompt }] }]
+    });
+
+    const enhanced = (await response.response.text()).trim();
+    return enhanced || userPrompt;
+
   } catch (error) {
     logger.error("Prompt enhancement failed", { error: error?.message || error });
+    return userPrompt;
   }
-  return userPrompt;
 }
 
 /* =========================
