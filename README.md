@@ -1,576 +1,654 @@
-# 🎨 CursorFor3D - AI-Powered 3D Modeling Assistant
+<div align="center">
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) [![Version](https://img.shields.io/badge/version-1.0.0-blue)](https://github.com/vaishnavv04/Cursorfor3D)
+# 🎨 CursorFor3D
 
-CursorFor3D revolutionizes 3D content creation by combining the power of AI with professional 3D modeling. This desktop application built with Electron allows artists and designers to create complex 3D models and scenes using natural language descriptions, while intelligently leveraging multiple generation methods for optimal results.
+### **AI-Powered 3D Modeling Assistant for Blender**
 
-## ✨ Key Features
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Blender](https://img.shields.io/badge/Blender-4.5%2B-orange)](https://www.blender.org/)
+[![Node.js](https://img.shields.io/badge/Node.js-20%2B-green)](https://nodejs.org/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-pgvector-blue)](https://github.com/pgvector/pgvector)
 
-### 🤖 AI-Powered 3D Generation
-- **Natural Language to 3D**: Convert text descriptions into detailed 3D models using Google Gemini 2.5 Flash
-- **Multi-Source Generation**: Automatically selects the best approach from:
-  - **Hyper3D/Rodin**: High-quality, photorealistic 3D models from text prompts
-  - **Sketchfab Integration**: Access to thousands of pre-made 3D assets
-  - **PolyHaven Assets**: High-quality HDRIs, textures, and 3D models
-  - **Procedural Generation**: Custom Blender Python code generation for complex scenes
+**Transform natural language into professional 3D models powered by LangGraph ReAct agents**
 
-### 🎯 Smart Features
-- **Intelligent Prompt Enhancement**: Groq-powered llama-3.1-8b-instant model enhances prompts for better results
-- **Context-Aware Modeling**: Maintains scene context and spatial relationships across conversations
-- **ReAct Agent System**: Advanced reasoning loop with tool selection and execution
-- **Automatic Error Recovery**: Self-healing code generation with retry mechanisms
-- **Real-Time Progress Tracking**: Structured timeline events with detailed generation steps
-- **Visual Refinement**: Optional viewport screenshot analysis for iterative improvements
-- **RAG-Powered Knowledge Base**: Vector embeddings of Blender 4.5 Python API documentation for context-aware code generation
-- **Smart Integration Orchestration**: Automatic selection of optimal generation method based on prompt analysis
-- **Robust Connection Handling**: Automatic reconnection and error recovery for Blender TCP communication
+[Features](#-features) • [Quick Start](#-quick-start) • [Architecture](#-architecture) • [API Docs](#-api-documentation) • [Troubleshooting](#-troubleshooting)
 
-### 💻 Technical Architecture
-- **Blender TCP Integration**: Direct socket communication with Blender addon on port 9876
-- **ReAct Agent Framework**: Reason-Act-Observe loop for intelligent task execution
-- **Multi-LLM Support**: 
-  - **Google Gemini 2.5 Flash**: Primary model for Blender code generation and reasoning
-  - **Groq llama-3.3-70b**: Alternative model for code generation and agent tasks
-  - **Cohere Command R+**: Additional model option for diverse generation strategies
-  - **Groq llama-3.1-8b-instant**: Fast prompt enhancement for improved generation quality
-- **Modern Frontend**: Electron + React with Tailwind CSS for responsive UI
-- **Backend API**: Node.js/Express server with PostgreSQL and pgvector for data persistence
-- **Smart Caching**: LRU cache with configurable TTL reduces redundant API calls
-- **Vector Database**: pgvector extension for semantic search of Blender API documentation
-- **RAG System**: Retrieval-Augmented Generation using Xenova/all-MiniLM-L6-v2 for context-aware code generation
-- **Robust Socket Management**: Automatic reconnection, queue management, and error recovery for TCP communication
+</div>
+
+---
+
+## 📖 Overview
+
+CursorFor3D is an intelligent 3D content creation system that combines **LangGraph ReAct agents**, **RAG-powered knowledge bases**, and **multiple 3D asset integrations** to convert natural language into Blender 3D models. Built with Node.js, React, and Electron, it provides a production-ready desktop application for AI-assisted 3D modeling.
+
+### 🎯 Core Capabilities
+
+- **🤖 LangGraph ReAct Agent**: Intelligent task decomposition with parallel execution and dynamic replanning
+- **🧠 RAG Knowledge Base**: Vector embeddings of Blender 4.5 API documentation for context-aware code generation  
+- **👁️ Vision Validation**: Gemini Vision API analyzes viewport screenshots for quality assurance
+- **🌐 Multi-Integration**: Automatic routing between Hyper3D, Sketchfab, and PolyHaven
+- **🔄 Circuit Breakers**: Resilient integration handling with automatic fallback
+- **💾 Conversation Management**: Persistent chat history with PostgreSQL + pgvector
+- **📊 Cost Tracking**: Built-in API usage monitoring and analytics
+- **🔐 Production Security**: JWT authentication, rate limiting, and structured logging
+
+---
+
+## ✨ Features
+
+### LangGraph ReAct Agent System
+
+The core of CursorFor3D is a sophisticated **ReAct (Reason-Act-Observe) agent** built with LangGraph:
+
+```
+User Request → Task Decomposition → Parallel Execution → Validation → Response
+                    ↓                      ↓                  ↓
+              Subtask Planning      Tool Selection     Vision Check
+                    ↓                      ↓                  ↓
+             Dynamic Replanning    Circuit Breakers   Error Recovery
+```
+
+**Key Features:**
+- **Atomic Task Decomposition**: Breaks complex requests into independently executable subtasks
+- **Parallel Execution**: Runs independent subtasks simultaneously for faster completion
+- **Dynamic Replanning**: Automatically generates alternative strategies when >50% of tasks fail
+- **Conditional Logic**: Supports "if-then" fallback chains (e.g., "if integration fails, generate code")
+- **Loop Protection**: Maximum 10 reasoning loops with automatic termination
+- **State Management**: Maintains scene context, RAG context, and execution history
+
+**Available Tools:**
+1. `search_knowledge_base` - RAG search against Blender 4.5 API docs
+2. `get_scene_info` - Retrieve current Blender scene state
+3. `execute_blender_code` - Run sanitized Python code with auto-retry
+4. `asset_search_and_import` - Smart routing to Hyper3D/Sketchfab/PolyHaven
+5. `analyze_image` - Gemini Vision analysis of uploaded images
+6. `validate_with_vision` - Screenshot-based quality validation
+7. `create_animation` - Generate hop/walk/rotate/bounce animations
+8. `finish_task` - Mark task complete with validation checks
+
+### RAG-Powered Code Generation
+
+**Vector Knowledge Base:**
+- **380-dimensional embeddings** using `Xenova/all-MiniLM-L6-v2`
+- **2044+ Blender API documentation chunks** indexed in pgvector
+- **Cosine similarity search** (threshold > 0.2) for relevant context retrieval
+- **Automatic code sanitization** removes deprecated Blender 4.5 parameters
+- **Error-specific repair** with contextual fixes from knowledge base
+
+**Blender 4.5 Compatibility:**
+```python
+# ✅ Current (4.5+)
+bpy.ops.object.delete()  # No use_global
+bpy.ops.mesh.primitive_cube_add(location=(0,0,0))  # No use_undo
+
+# ❌ Deprecated (removed in 4.5)
+bpy.ops.object.delete(use_global=False)
+bpy.ops.mesh.primitive_cube_add(use_undo=True)
+```
+
+### Vision Validation System
+
+**Gemini Vision API Integration:**
+- **Viewport Screenshot Capture**: Automatic screenshot via `get_viewport_screenshot` command
+- **Quality Scoring**: 0-10 scale with detailed breakdown
+- **Visual Analysis**: Object detection, color verification, geometry quality
+- **Issue Detection**: Identifies problems (missing objects, wrong colors, artifacts)
+- **Actionable Suggestions**: Provides specific improvement recommendations
+
+**Evaluation Criteria:**
+- Object Presence (30%)
+- Geometry Accuracy (25%)
+- Material/Color (20%)
+- Composition (15%)
+- Technical Quality (10%)
+
+### Multi-Integration System
+
+**Smart Asset Routing:**
+
+| Integration | Use Cases | Keywords | Circuit Breaker |
+|-------------|-----------|----------|-----------------|
+| **Hyper3D (Rodin)** | Photorealistic creatures, sculptures | realistic, dragon, monster | 3 failures = 30s timeout |
+| **Sketchfab** | Branded models, specific objects | sketchfab, specific model, brand | 3 failures = 30s timeout |
+| **PolyHaven** | Textures, HDRIs, generic furniture | texture, hdri, wooden chair | 3 failures = 30s timeout |
+| **Procedural** | Everything else | _fallback_ | No limit |
+
+**Circuit Breaker Protection:**
+- **CLOSED**: Normal operation (all requests allowed)
+- **HALF_OPEN**: Testing recovery (2 successes needed)
+- **OPEN**: Service blocked (30s timeout)
+- **Automatic Reset**: Self-healing when service recovers
+
+### Network Resilience
+
+**Timeout Protection:**
+```python
+# All Blender addon network requests now have timeouts
+polyhaven_api_call(..., timeout=30)    # 11 API calls protected
+download_file(..., timeout=60)          # 8 downloads protected
+```
+
+**Connection Management:**
+- **Auto-Reconnect**: Exponential backoff (5s → 10s → 20s → 60s max)
+- **Request Queue**: Sequential command processing prevents race conditions
+- **Graceful Degradation**: Falls back to code generation when integrations fail
+
+### API Cost Tracking
+
+**Automatic Usage Monitoring:**
+```sql
+-- New table: api_usage
+user_id | provider | model | usage | cost_usd | created_at
+```
+
+**Features:**
+- **Auto-calculation**: Token counts → USD costs via configurable rates
+- **Per-provider tracking**: Separate analytics for Gemini, Groq, etc.
+- **Historical analysis**: Query usage by user, date range, or model
+- **Cost optimization**: Identify expensive operations
+
+---
+
+## 🏗️ Architecture
+
+### System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Electron + React Frontend                 │
+│  (Chat UI, Attachment Handling, Progress Tracking)          │
+└───────────────────────────┬─────────────────────────────────┘
+                            │ HTTP/REST
+┌───────────────────────────▼─────────────────────────────────┐
+│                    Node.js Express Backend                   │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │          LangGraph ReAct Agent Engine                │  │
+│  │  • Task Decomposition  • Parallel Execution          │  │
+│  │  • Dynamic Replanning  • Tool Orchestration          │  │
+│  └──────────────┬───────────────────────────────────────┘  │
+│                 │                                            │
+│  ┌──────────────▼───────────────────────────────────────┐  │
+│  │      RAG System (pgvector + Embeddings)              │  │
+│  │  • Blender API Docs  • Semantic Search               │  │
+│  └──────────────┬───────────────────────────────────────┘  │
+│                 │                                            │
+│  ┌──────────────▼───────────────────────────────────────┐  │
+│  │    Integration Layer (Circuit Breakers)              │  │
+│  │  • Hyper3D • Sketchfab • PolyHaven • Vision API     │  │
+│  └──────────────┬───────────────────────────────────────┘  │
+└─────────────────┼────────────────────────────────────────┘
+                  │ TCP Socket (Port 9876)
+┌─────────────────▼────────────────────────────────────────┐
+│              Blender 4.5+ with MCP Addon                 │
+│  • Python Execution • Asset Import • Screenshot Capture  │
+└──────────────────────────────────────────────────────────┘
+```
+
+### Tech Stack
+
+**Backend:**
+- **Runtime**: Node.js 20+ (ESM modules)
+- **Framework**: Express.js 5.1
+- **Agent**: LangGraph 1.0 + LangChain Core
+- **Database**: PostgreSQL with pgvector extension
+- **Embeddings**: `@xenova/transformers` (Xenova/all-MiniLM-L6-v2)
+- **LLMs**: Google Gemini 2.5 Flash, Groq Llama 3.3 70B
+- **Security**: JWT, bcrypt, express-rate-limit
+- **Logging**: Winston 3.18
+
+**Frontend:**
+- **Framework**: React 18.3
+- **Desktop**: Electron 31.7
+- **Routing**: React Router DOM 6.30
+- **Styling**: Tailwind CSS 3.4
+- **Icons**: Lucide React, React Icons
+- **State**: React Context + TanStack Query
+
+**Infrastructure:**
+- **TCP Communication**: Node.js `net` module (port 9876)
+- **Python Environment**: Virtual environment (`venv-mcp`) for embedding model
+- **Blender Addon**: Custom TCP server in `addon.py`
+
+---
 
 ## 🚀 Quick Start
 
 ### Prerequisites
 
-- **Blender 4.5+** with MCP add-on enabled on port 9876
-- **Node.js 20+** and npm
-- **Google Gemini API key** (required for Blender code generation)
-- **Groq API key** (required for prompt enhancement)
-- **PostgreSQL** database (or Supabase) with pgvector extension
-- **Python 3.x** with virtual environment support
-- (Optional) **Sketchfab API key** for additional 3D model access
+```bash
+✅ Blender 4.5+ (with MCP addon installed)
+✅ Node.js 20+ and npm
+✅ PostgreSQL 14+ with pgvector extension
+✅ Python 3.8+ (for embedding model)
+✅ Google Gemini API key (primary LLM)
+✅ Groq API key (prompt enhancement)
+```
 
-### Installation
+### Installation Steps
 
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/vaishnavv04/Cursorfor3D.git
-   cd CursorFor3D
-   ```
+**1. Clone Repository**
+```bash
+git clone https://github.com/vaishnavv04/Cursorfor3D.git
+cd CursorFor3D
+```
 
-2. **Set up Python virtual environment (backend)**
-   ```bash
-   cd backend
-   python -m venv venv-mcp
-   # On Windows:
-   .\venv-mcp\Scripts\activate
-   # On macOS/Linux:
-   source venv-mcp/bin/activate
-   
-   # Install Python dependencies
-   pip install -r requirements.txt
-   ```
+**2. Backend Setup**
+```bash
+cd backend
 
-3. **Configure environment variables**
-   
-   Create a `.env` file in the `backend` directory:
-   ```env
-   # Required
-   JWT_SECRET=your_secure_jwt_secret_here
-   DATABASE_URL=postgresql://user:password@localhost:5432/cursor3d
-   GEMINI_API_KEY=your_gemini_api_key_here
-   GROQ_API_KEY=your_groq_api_key_here
-   
-   # Optional Integrations
-   SKETCHFAB_API_KEY=your_sketchfab_key_here
-   
-   # Server Configuration
-   PORT=5000
-   BLENDER_TCP_HOST=127.0.0.1
-   BLENDER_TCP_PORT=9876
-   
-   # Model Configuration
-   GEMINI_MODEL=gemini-2.5-flash
-   LLM_REPAIR_ATTEMPTS=2
-   
-   # Caching Configuration
-   CODE_CACHE_MAX=100
-   CODE_CACHE_TTL_MS=300000
-   
-   # Rate Limiting
-   RATE_LIMIT_WINDOW_MS=60000
-   RATE_LIMIT_MAX=30
-   ```
+# Create Python virtual environment
+python -m venv venv-mcp
+# Windows:
+.\venv-mcp\Scripts\activate
+# macOS/Linux:
+source venv-mcp/bin/activate
 
-4. **Install backend dependencies**
-   ```bash
-   npm install
-   ```
+# Install Python dependencies
+pip install requests pillow numpy
 
-5. **Install frontend dependencies**
-   ```bash
-   cd ../frontend
-   npm install
-   ```
+# Install Node.js dependencies
+npm install
+```
 
-6. **Set up PostgreSQL database with pgvector**
-   
-   Create a database and enable the pgvector extension:
-   ```sql
-   CREATE DATABASE cursor3d;
-   \c cursor3d;
-   CREATE EXTENSION IF NOT EXISTS vector;
-   ```
-   
-   The schema will be automatically initialized on first run.
+**3. Environment Configuration**
 
-7. **Initialize the knowledge base (optional but recommended)**
-   ```bash
-   cd backend
-   node scripts/embed_docs.js
-   ```
-   This will embed the Blender 4.5 Python API documentation for enhanced code generation.
+Create `backend/.env`:
+```env
+# Required
+JWT_SECRET=your_secure_random_string_min_32_chars
+DATABASE_URL=postgresql://user:password@localhost:5432/cursor3d
+GEMINI_API_KEY=your_google_gemini_api_key
+GROQ_API_KEY=your_groq_api_key
 
-8. **Set up Blender**
-   - Install Blender 4.5 or higher
-   - Install and enable the MCP add-on
-   - Configure it to listen on `127.0.0.1:9876`
-   - Start the MCP server in Blender
+# Blender Connection
+BLENDER_TCP_HOST=127.0.0.1
+BLENDER_TCP_PORT=9876
+
+# Optional Integrations
+SKETCHFAB_API_KEY=your_sketchfab_api_key
+
+# Performance Tuning
+CODE_CACHE_MAX=100
+CODE_CACHE_TTL_MS=300000
+RATE_LIMIT_MAX=30
+RATE_LIMIT_WINDOW_MS=60000
+```
+
+**4. Database Setup**
+```sql
+-- Create database
+CREATE DATABASE cursor3d;
+\c cursor3d;
+
+-- Enable pgvector extension
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Schema auto-initializes on first run
+```
+
+**5. Initialize Knowledge Base**
+```bash
+cd backend
+node scripts/embed_docs.js
+# Embeds 2044+ Blender API documentation chunks
+```
+
+**6. Frontend Setup**
+```bash
+cd frontend
+npm install
+```
+
+**7. Blender Setup**
+- Install Blender 4.5+
+- Load `backend/addon.py` as addon
+- Enable MCP server (port 9876)
+- Verify connection in console
 
 ### Running the Application
 
-1. **Start the backend server**
-   ```bash
-   cd backend
-   npm start
-   ```
-   Server will start on `http://localhost:5000`
+**Terminal 1 - Backend:**
+```bash
+cd backend
+# Activate Python venv first
+.\venv-mcp\Scripts\activate  # Windows
+source venv-mcp/bin/activate  # macOS/Linux
+npm start
+```
 
-2. **Build and start the frontend**
-   ```bash
-   cd ../frontend
-   npm run build
-   npm start
-   ```
-   The Electron app will launch automatically.
+**Terminal 2 - Frontend:**
+```bash
+cd frontend
+npm run dev  # Development mode with hot reload
+# OR
+npm run build && npm start  # Production build
+```
 
-3. **Verify Blender connection**
-   - Ensure Blender is running with MCP add-on active
-   - Check backend console for "✅ Connected to Blender addon socket server" message
+**Verification:**
+- Backend: http://localhost:5000 (API ready)
+- Frontend: Electron window opens automatically
+- Blender: Check console for "Connected to Blender TCP server"
 
-## 🎨 Usage Guide
-
-### Getting Started
-
-1. **Create an account**
-   - Launch the application
-   - Sign up with email and password (minimum 8 characters)
-   - Log in to access the generation interface
-
-2. **Start a conversation**
-   - Click "New Scene" to create a new conversation
-   - Type your 3D model description in natural language
-   - Enable "Enhance Prompt" for more detailed results (optional)
-
-3. **Generate 3D content**
-   - Example prompts:
-     - "Create a realistic dragon with detailed scales"
-     - "Add a wooden chair next to the table"
-     - "Create a procedural terrain with mountains"
-     - "Apply a metallic material to the sphere"
-     - "Add an HDRI sky texture"
-
-4. **Refine and iterate**
-   - Continue the conversation to refine your model
-   - Ask for specific modifications
-   - The system maintains scene context throughout
-
-### Advanced Features
-
-#### Prompt Enhancement
-Enable "Enhance Prompt" to automatically improve your descriptions with technical details using Groq's llama-3.1-8b-instant model for better generation quality.
-
-#### Visual Refinement
-The system can capture viewport screenshots and suggest improvements based on visual analysis using Gemini's vision capabilities.
-
-#### Multiple Generation Sources
-The system automatically detects the best generation method based on keywords:
-- **Hyper3D/Rodin**: Photorealistic models (keywords: realistic, photorealistic, creature, dragon, monster, sculpture, high detail)
-- **Sketchfab**: Specific branded models (keywords: specific model, brand name, realistic car)
-- **PolyHaven**: Textures, HDRIs, and generic assets (keywords: texture, hdri, material, wooden chair, table)
-- **Procedural**: Custom Blender Python code generation for everything else
-
-#### Error Recovery
-If code execution fails, the system automatically:
-1. Analyzes the error message
-2. Generates targeted fixes using Gemini
-3. Retries execution (up to 2 additional attempts)
-4. Provides helpful hints for common issues
+---
 
 ## 📚 API Documentation
 
-### Project Structure
-```
-CursorFor3D/
-├── backend/                    # Node.js Express API server
-│   ├── addon.py               # Python script for Blender MCP addon
-│   ├── server.js              # Main server file with all endpoints
-│   ├── db.js                  # PostgreSQL database configuration
-│   ├── package.json           # Backend dependencies
-│   ├── integrations/          # External service integrations
-│   │   ├── index.js           # Central integration orchestrator
-│   │   ├── hyper3d.js         # Hyper3D/Rodin API integration
-│   │   ├── polyhaven.js       # PolyHaven asset integration
-│   │   ├── sketchfab.js       # Sketchfab API integration
-│   │   └── check_integration.js  # Integration status checks
-│   ├── scripts/               # Utility and setup scripts
-│   │   ├── embed_docs.js      # Knowledge base embedding script
-│   │   └── knowledge/         # Blender API documentation
-│   │       ├── blender_api.txt
-│   │       └── blender_python_reference_4_5.zip
-│   ├── utils/                 # Utility modules
-│   │   └── progress.js        # Progress tracking system
-│   └── venv-mcp/             # Python virtual environment
-├── frontend/                  # React + Electron desktop app
-│   ├── main.js               # Electron main process
-│   ├── package.json          # Frontend dependencies
-│   ├── build/                # Production build output
-│   ├── public/               # Static assets
-│   └── src/                  # React source code
-│       ├── App.js            # Main application component
-│       ├── components/       # Reusable components
-│       │   ├── ChatInterface.jsx    # Chat UI
-│       │   ├── Promptcard.jsx      # Prompt input card
-│       │   ├── navbar.js           # Navigation bar
-│       │   └── authmodel.js        # Authentication modal
-│       ├── context/          # React context providers
-│       │   └── AuthContext.jsx     # Authentication context
-│       └── pages/            # Page components
-│           ├── homepage.js         # Landing page
-│           ├── authpage.js         # Login/signup page
-│           └── generatorpage.js   # Main generation interface
-└── README.md                 # This file
-```
-
-### REST API Endpoints
+### REST Endpoints
 
 #### Authentication
-- `POST /api/auth/signup` - Create new user account
-  - Body: `{ email, password, displayName? }`
-  - Returns: `{ token, user }`
+```http
+POST /api/auth/signup
+Content-Type: application/json
 
-- `POST /api/auth/login` - Authenticate user
-  - Body: `{ email, password }`
-  - Returns: `{ token, user }`
+{
+  "email": "user@example.com",
+  "password": "securepassword",
+  "displayName": "John Doe"
+}
 
-- `GET /api/auth/me` - Get current user
-  - Headers: `Authorization: Bearer <token>`
-  - Returns: `{ user }`
+Response: { "token": "jwt_token", "user": {...} }
+```
 
-#### Conversations
-- `GET /api/conversations` - List all user conversations
-  - Returns: `{ conversations: [...] }`
+```http
+POST /api/auth/login
+Content-Type: application/json
 
-- `POST /api/conversation/new` - Create new conversation
-  - Body: `{ title? }`
-  - Returns: `{ conversation }`
+{
+  "email": "user@example.com",
+  "password": "securepassword"
+}
 
-- `GET /api/conversation/:conversationId` - Get conversation details
-  - Returns: `{ conversation, messages }`
+Response: { "token": "jwt_token", "user": {...} }
+```
 
-- `DELETE /api/conversation/:conversationId` - Delete conversation
-  - Returns: `{ success: true }`
+#### Generation (LangGraph Agent)
+```http
+POST /api/generate
+Authorization: Bearer {token}
+Content-Type: application/json
 
-#### Generation
-- `POST /api/generate` - Generate 3D content (full response)
-  - Body: `{ prompt, conversationId?, enhancePrompt?, captureScreenshot?, dryRun?, debug?, visualRefine?, agentType? }`
-  - Returns: `{ response, blenderResult, provider, conversationId, messages, attempts, screenshot?, progress }`
+{
+  "prompt": "Create a red metallic cube at origin",
+  "conversationId": "uuid-or-null",
+  "model": "gemini",
+  "captureScreenshot": false,
+  "debug": false,
+  "attachments": [
+    {
+      "name": "reference.jpg",
+      "type": "image/jpeg",
+      "dataUrl": "data:image/jpeg;base64,..."
+    }
+  ]
+}
 
-- `GET /api/generate/stream` - Generate with real-time progress (Server-Sent Events)
-  - Query: `?prompt=...&conversationId=...&captureScreenshot=...`
-  - Streams: `event: status/error/complete`
+Response: {
+  "success": true,
+  "response": "✅ Here you go! I've completed your request...",
+  "blenderResult": { "status": "success", "result": "..." },
+  "conversationId": "uuid",
+  "messages": [...],
+  "provider": "gemini-2.5-flash",
+  "progress": [...],
+  "langGraph": true,
+  "loopCount": 5,
+  "finished": true
+}
+```
 
-- `POST /api/enhance-prompt` - Enhance prompt before generation
-  - Body: `{ prompt, conversationId? }`
-  - Returns: `{ enhancedPrompt }`
+#### Prompt Enhancement
+```http
+POST /api/enhance-prompt
+Authorization: Bearer {token}
+Content-Type: application/json
 
-- `POST /api/scene-info` - Get current Blender scene information
-  - Body: `{ conversationId? }`
-  - Returns: Scene context object
+{
+  "prompt": "add a chair",
+  "conversationHistory": [...]
+}
 
-#### Analytics & Feedback
-- `POST /api/feedback` - Submit feedback on generation
-  - Body: `{ conversationId, messageId, rating: 'up'|'down' }`
-  - Returns: `{ ok: true }`
+Response: { "enhancedPrompt": "Create a detailed wooden chair..." }
+```
 
-- `GET /api/analytics/summary` - Get generation statistics
-  - Returns: `{ totalGenerations, success, errors, avgAttempts, avgDurationMs }`
+#### Conversation Management
+```http
+GET /api/conversations
+Authorization: Bearer {token}
 
-- `GET /api/suggest` - Get prompt suggestions
-  - Query: `?prefix=...`
-  - Returns: `{ suggestions: [...] }`
+Response: { "conversations": [...] }
+```
 
-## 🛠️ Technical Details
+```http
+GET /api/conversation/:id
+Authorization: Bearer {token}
 
-### ReAct Agent System
-The system uses a sophisticated Reason-Act-Observe loop for task execution:
-- **Reasoning**: Agent analyzes user request and formulates a plan
-- **Tool Selection**: Chooses from available tools (search_knowledge_base, execute_blender_code, get_scene_info, asset_search_and_import, finish_task)
-- **Execution**: Executes selected tool and observes results
-- **Iteration**: Continues loop until task is complete (max 10 loops)
-- **Error Recovery**: Automatically retries with fixes when code execution fails
+Response: { "conversation": {...}, "messages": [...] }
+```
 
-### Blender Code Generation
-The system generates Blender 4.5-compatible Python code with strict validation:
-- Automatic import of `bpy` module
-- Removal of deprecated parameters (`use_undo`, `use_global`, `constraint_axis`)
-- Fix for Blender 4.5 API changes (Voronoi/Musgrave node updates)
-- Safe deletion patterns and edit mode handling
-- Error-specific hints for common issues
-- **RAG-Enhanced Generation**: Uses vector embeddings of Blender API documentation for context-aware code suggestions
-- **Semantic Search**: Retrieves relevant API documentation based on prompt context using pgvector similarity search
-- **Code Sanitization**: Automatic cleanup and validation before execution
+```http
+DELETE /api/conversation/:id
+Authorization: Bearer {token}
 
-### Smart Caching
-- **LRU Cache**: Stores generated code with SHA-256 hash keys
-- **Configurable TTL**: Default 5 minutes (300,000ms)
-- **Cache Size**: Max 100 entries (configurable)
-- Reduces redundant API calls for similar prompts
+Response: { "success": true }
+```
 
-### Rate Limiting
-- Per-user rate limiting (in-memory)
-- Default: 30 requests per 60 seconds
-- Returns 429 status with `Retry-After` header when exceeded
+#### Health & Monitoring
+```http
+GET /api/health
 
-### Progress Tracking
-Structured timeline with stages:
-- `init` - Starting workflow
-- `conversation_lookup/create` - Managing conversation
-- `scene_context` - Fetching Blender scene
-- `integration_check` - Checking available integrations
-- `orchestrate_*` - Asset integration steps
-- `model_generate` - AI code generation
-- `attempt` - Execution attempts
-- `screenshot` - Viewport capture
-- `visual_refine` - Visual refinement
+Response: {
+  "status": "healthy",
+  "timestamp": "2025-11-18T...",
+  "uptime": 3600,
+  "services": {
+    "blender": { "connected": true, "host": "127.0.0.1", "port": 9876 },
+    "database": { "status": "connected" },
+    "apiKeys": { "gemini": "configured", "groq": "configured" },
+    "integrations": {
+      "hyper3d": "enabled",
+      "polyhaven": "enabled",
+      "sketchfab": "disabled"
+    },
+    "circuitBreakers": {
+      "hyper3d": { "state": "CLOSED", "failureCount": 0 },
+      "sketchfab": { "state": "OPEN", "nextAttempt": 1731931200000 },
+      "polyhaven": { "state": "CLOSED", "failureCount": 0 }
+    },
+    "rag": {
+      "status": "available",
+      "tables": { "blender_knowledge_new": true, "blender_knowledge": true },
+      "embeddingModel": "Xenova/all-MiniLM-L6-v2"
+    }
+  }
+}
+```
 
-### Database Schema
-**Tables:**
-- `users` - User accounts with bcrypt password hashing
-- `conversations` - Chat sessions with scene context
-- `messages` - Conversation messages with metadata
-- `blender_knowledge` - Vector embeddings of Blender API documentation (380-dimensional)
-- `blender_knowledge_new` - Enhanced knowledge base with improved chunking strategy
+---
 
-All timestamps use PostgreSQL `TIMESTAMP WITH TIME ZONE` for consistency.
-
-## 🔧 Configuration
+## 🛠️ Configuration
 
 ### Environment Variables
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `JWT_SECRET` | Yes | - | Secret key for JWT token signing |
-| `DATABASE_URL` | Yes | - | PostgreSQL connection string |
-| `GEMINI_API_KEY` | Yes | - | Google Gemini API key |
-| `GROQ_API_KEY` | Yes | - | Groq API key for prompt enhancement |
-| `SKETCHFAB_API_KEY` | No | - | Sketchfab API key (optional) |
-| `PORT` | No | 5000 | Backend server port |
-| `BLENDER_TCP_HOST` | No | 127.0.0.1 | Blender MCP host |
-| `BLENDER_TCP_PORT` | No | 9876 | Blender MCP port |
-| `GEMINI_MODEL` | No | gemini-2.5-flash | Gemini model to use |
-| `LLM_REPAIR_ATTEMPTS` | No | 2 | Max code repair attempts |
-| `CODE_CACHE_MAX` | No | 100 | Max cache entries |
-| `CODE_CACHE_TTL_MS` | No | 300000 | Cache TTL in milliseconds |
-| `RATE_LIMIT_WINDOW_MS` | No | 60000 | Rate limit window |
-| `RATE_LIMIT_MAX` | No | 30 | Max requests per window |
-| `EMBEDDING_DIM` | No | 380 | Dimension for vector embeddings |
-| `EMBEDDING_MODEL` | No | Xenova/all-MiniLM-L6-v2 | Model for knowledge base embeddings |
+| `JWT_SECRET` | ✅ | - | Secret for JWT signing (32+ chars) |
+| `DATABASE_URL` | ✅ | - | PostgreSQL connection string |
+| `GEMINI_API_KEY` | ✅ | - | Google Gemini API key |
+| `GEMINI_API_KEY_1`, `_2`, `_3` | ❌ | - | Multiple keys for rotation |
+| `GROQ_API_KEY` | ✅ | - | Groq API for prompt enhancement |
+| `SKETCHFAB_API_KEY` | ❌ | - | Sketchfab integration (optional) |
+| `BLENDER_TCP_HOST` | ❌ | 127.0.0.1 | Blender addon host |
+| `BLENDER_TCP_PORT` | ❌ | 9876 | Blender addon port |
+| `PORT` | ❌ | 5000 | Backend server port |
+| `CODE_CACHE_MAX` | ❌ | 100 | Max cached code entries |
+| `CODE_CACHE_TTL_MS` | ❌ | 300000 | Cache TTL (5 min) |
+| `RATE_LIMIT_MAX` | ❌ | 30 | Max requests per window |
+| `RATE_LIMIT_WINDOW_MS` | ❌ | 60000 | Rate limit window (1 min) |
 
-## 🤝 Contributing
+---
 
-We welcome contributions! Here's how you can help:
-
-### Getting Started
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/AmazingFeature`)
-3. Make your changes
-4. Test thoroughly
-5. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-6. Push to the branch (`git push origin feature/AmazingFeature`)
-7. Open a Pull Request
-
-### Development Guidelines
-- Follow existing code style
-- Add comments for complex logic
-- Update README if adding new features
-- Test with Blender 4.5+
-- Ensure backward compatibility where possible
-
-### Areas for Contribution
-- Additional integration sources (more 3D asset libraries)
-- UI/UX improvements
-- Performance optimizations
-- Bug fixes and error handling
-- Documentation improvements
-- Test coverage
-- **Knowledge Base Enhancement**: Add more Blender API documentation and tutorials
-- **RAG System Improvements**: Better chunking strategies and embedding models
-- **Integration Development**: Create new asset source integrations
-
-## � Troubleshooting
+## 🔧 Troubleshooting
 
 ### Common Issues
 
-#### Backend Connection Issues
-- **"Blender is not connected"** or **"Socket is closed"**
-  - Ensure Blender is running with TCP server addon enabled
-  - Check that the addon is listening on port 9876
-  - Verify `BLENDER_TCP_HOST` and `BLENDER_TCP_PORT` in `.env`
-  - Backend automatically retries connection every 5 seconds
-  - Check backend console for "✅ Connected to Blender TCP server" message
-  - If connection drops during operation, backend will attempt automatic reconnection
+#### ❌ "Blender is not connected"
+**Symptoms:** Agent cannot execute code or import assets
 
-#### API Key Errors
-- **Gemini API errors**
-  - Verify `GEMINI_API_KEY` is valid and active
-  - Check API quota limits on Google Cloud Console
-  - Ensure billing is enabled for the API key
+**Solutions:**
+1. Ensure Blender is running with `addon.py` loaded
+2. Check MCP server is active (green indicator in Blender sidebar)
+3. Verify `BLENDER_TCP_PORT=9876` in `.env`
+4. Check backend console for reconnection attempts
+5. Restart Blender and reload addon if connection fails repeatedly
 
-- **Groq API errors**
-  - Verify `GROQ_API_KEY` is valid
-  - Check rate limits on Groq dashboard
-  - Prompt enhancement will fall back to original prompt if Groq fails
+#### ❌ "Circuit breaker is OPEN"
+**Symptoms:** Integration (Hyper3D/Sketchfab/PolyHaven) unavailable
 
-#### Database Issues
-- **"Database connection failed"**
-  - Verify PostgreSQL is running
-  - Check `DATABASE_URL` format: `postgresql://user:password@host:port/database`
-  - Ensure database exists: `CREATE DATABASE cursor3d;`
-  - **Enable pgvector extension**: `CREATE EXTENSION IF NOT EXISTS vector;`
-  - Check PostgreSQL logs for connection errors
+**Solutions:**
+1. Wait 30 seconds for automatic recovery attempt
+2. Check integration status: `GET /api/health`
+3. Verify API keys in Blender addon settings
+4. Check rate limits on integration provider dashboards
+5. Manually reset via Blender MCP panel
 
-- **"pgvector extension not found"**
-  - Install pgvector: https://github.com/pgvector/pgvector#installation
-  - Enable extension in your database: `CREATE EXTENSION IF NOT EXISTS vector;`
-  - Restart PostgreSQL server after installation
+#### ❌ "Knowledge base not initialized"
+**Symptoms:** RAG searches return no results
 
-#### Authentication Issues
-- **"JWT_SECRET environment variable is required"**
-  - Add `JWT_SECRET` to `.env` file
-  - Use a secure random string (at least 32 characters)
-  - Restart backend server after adding
+**Solutions:**
+1. Run: `node scripts/embed_docs.js`
+2. Check `blender_knowledge_new` table exists in database
+3. Verify pgvector extension: `CREATE EXTENSION IF NOT EXISTS vector;`
+4. Ensure Python venv is activated when running embed script
+5. Check `scripts/knowledge/` directory has Blender docs
 
-#### Generation Failures
-- **"Timeout: No response for [command]"**
-  - Long-running operations (Hyper3D, downloads) have 60s timeout
-  - Standard operations timeout after 15s
-  - Check Blender console for errors
-  - Verify internet connection for API calls
-  - Backend will discard late responses from timed-out requests
+#### ❌ "Task completed with issues"
+**Symptoms:** Agent finishes but some operations failed
 
-- **Blender execution errors**
-  - Check that objects are selected when required
-  - Ensure correct mode (OBJECT vs EDIT)
-  - ReAct agent automatically analyzes errors and retries with fixes
-  - Agent can make up to 10 reasoning loops to complete the task
-  - Check progress tracking for detailed step-by-step information
+**Solutions:**
+1. Enable debug mode: `{ "debug": true }` in API request
+2. Check `progress` array for specific failure details
+3. Verify Blender viewport is in correct mode (OBJECT/EDIT)
+4. Review `subtaskResults` in response for error messages
+5. Try breaking complex requests into smaller steps
 
-#### Frontend Issues
-- **Electron window blank**
-  - Wait for React dev server to finish compiling
-  - Check browser console (Ctrl+Shift+I) for errors
-  - Try rebuilding: `npm run build`
+#### ❌ "Vision validation failed"
+**Symptoms:** Screenshot analysis not working
 
-- **Connection refused**
-  - Ensure backend is running on port 5000
-  - Check for port conflicts
-  - Verify frontend is configured to connect to correct backend URL
-
-#### Knowledge Base Issues
-- **"Knowledge base not initialized"**
-  - Run: `cd backend && node scripts/embed_docs.js`
-  - Ensure `scripts/knowledge/blender_python_reference_4_5.zip` exists
-  - Check that pgvector extension is enabled in database
-  - Verify `EMBEDDING_DIM` matches database table dimensions
-
-- **"Embedding model loading failed"**
-  - Check internet connection for model download (first run only)
-  - Ensure sufficient disk space for model cache
-  - Verify `@xenova/transformers` dependency is installed
+**Solutions:**
+1. Ensure at least one 3D viewport is open in Blender
+2. Check Gemini API has vision capabilities enabled
+3. Verify screenshot capture works: Test with `get_viewport_screenshot` command
+4. Switch viewport to rendered/solid shading mode
+5. Check temp directory has write permissions
 
 ### Debug Mode
-Enable debug mode for detailed information:
+
+Enable verbose logging:
 ```javascript
-// In API request body
+// In API request
 {
   "prompt": "your prompt",
-  "debug": true  // Includes full prompts and system messages
+  "debug": true  // Returns full agent state and reasoning
 }
 ```
 
-### Logs
-- **Backend logs**: Check terminal running `npm start` in backend directory
-- **Blender logs**: Check Blender's system console (Window > Toggle System Console on Windows)
-- **Frontend logs**: Open DevTools (Ctrl+Shift+I) in Electron app
+**Backend Logs:**
+```bash
+# Set log level in backend
+export LOG_LEVEL=debug
+npm start
+```
 
-## 📝 License
+**Frontend DevTools:**
+```
+Ctrl+Shift+I (Windows/Linux)
+Cmd+Option+I (macOS)
+```
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+### Performance Optimization
+
+**Slow Generation:**
+- Use `CODE_CACHE_MAX=200` for better caching
+- Enable parallel execution (automatic in LangGraph)
+- Pre-warm RAG context with common queries
+- Use Gemini 2.5 Flash (faster than Groq for code)
+
+**High API Costs:**
+- Monitor via cost tracking in database
+- Use prompt enhancement selectively
+- Cache frequently used code patterns
+- Reduce `maxLoops` to 5 for simple tasks
+
+---
+
+## 🤝 Contributing
+
+We welcome contributions! Areas for improvement:
+
+### High Priority
+- [ ] Add OpenAI GPT-4 as alternative LLM
+- [ ] Implement batch generation for multiple objects
+- [ ] Add Blender scene diff viewer
+- [ ] Create automated test suite for agent workflows
+- [ ] Improve vision validation with multi-angle screenshots
+
+### Feature Requests
+- [ ] Support for animation timeline editing
+- [ ] Real-time collaboration via WebSockets
+- [ ] Export to GLTF/FBX/USD formats
+- [ ] Material library with PBR presets
+- [ ] Voice input for hands-free modeling
+
+### Code Quality
+- [ ] Add TypeScript types for backend
+- [ ] Increase test coverage to 80%+
+- [ ] Performance profiling for agent loops
+- [ ] API documentation with Swagger/OpenAPI
+
+**To Contribute:**
+```bash
+git checkout -b feature/your-feature-name
+# Make changes
+git commit -m "feat: add amazing feature"
+git push origin feature/your-feature-name
+# Open Pull Request
+```
+
+---
+
+## 📄 License
+
+MIT License - See [LICENSE](LICENSE) file
+
+---
 
 ## 🙏 Acknowledgments
 
-- **Blender Foundation** - For the amazing open-source 3D creation suite
-- **Google** - For Gemini 2.5 Flash AI model powering code generation
-- **Groq** - For fast prompt enhancement with llama-3.1-8b-instant
-- **OpenAI** - For inspiration in AI-assisted content creation
-- **Hyper3D/Rodin** - For high-quality 3D model generation API
-- **Sketchfab** - For extensive 3D model library
-- **PolyHaven** - For high-quality open-source 3D assets
-- The open-source community for countless libraries and tools
-
-## 📮 Contact & Support
-
-- **GitHub Issues**: [Report bugs or request features](https://github.com/vaishnavv04/Cursorfor3D/issues)
-- **Repository**: [github.com/vaishnavv04/Cursorfor3D](https://github.com/vaishnavv04/Cursorfor3D)
-
-## 🗺️ Roadmap
-
-### Planned Features
-- [ ] Support for additional 3D asset sources
-- [ ] Batch generation for multiple objects
-- [ ] Export to various 3D formats (GLB, FBX, OBJ)
-- [ ] Collaborative scene editing
-- [ ] Preset templates for common scenes
-- [ ] Animation generation capabilities
-- [ ] Material library integration
-- [ ] Cloud rendering support
-- [ ] Mobile companion app
-- [ ] Plugin system for extensibility
-- [ ] Advanced RAG capabilities with tutorial embeddings
-- [ ] Real-time collaboration features
-- [ ] Version control for scene iterations
-
-### Completed Features
-- [x] ReAct agent system with intelligent tool selection
-- [x] Hyper3D integration for realistic models
-- [x] PolyHaven asset integration
-- [x] Sketchfab model search and import
-- [x] Multi-LLM support (Gemini, Groq, Cohere)
-- [x] Robust socket connection handling with auto-reconnect
-- [x] Error recovery system with automatic retries
-- [x] Progress tracking with detailed timeline
-- [x] Prompt enhancement via Groq
-- [x] RAG-powered knowledge base with Blender API documentation
-- [x] Vector database integration with pgvector
-- [x] Smart integration orchestration system
-- [x] Semantic search for API documentation
-- [x] Request queue management and timeout handling
+- **Blender Foundation** - Open-source 3D creation suite
+- **Google** - Gemini 2.5 Flash and Vision API
+- **Groq** - Fast inference for Llama models
+- **LangChain** - LangGraph framework for agent workflows
+- **pgvector** - Vector similarity search in PostgreSQL
+- **Hyper3D/Rodin** - Photorealistic 3D generation
+- **PolyHaven** - High-quality CC0 3D assets
+- **Sketchfab** - Extensive 3D model library
 
 ---
+
+## 📮 Support & Community
+
+- **Issues**: [GitHub Issues](https://github.com/vaishnavv04/Cursorfor3D/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/vaishnavv04/Cursorfor3D/discussions)
+- **Repository**: [github.com/vaishnavv04/Cursorfor3D](https://github.com/vaishnavv04/Cursorfor3D)
+
+---
+
+<div align="center">
 
 **Built with ❤️ by [vaishnavv04](https://github.com/vaishnavv04)**
 
 *Star ⭐ this repository if you find it helpful!*
+
+**Last Updated:** January 2025
+
+</div>
