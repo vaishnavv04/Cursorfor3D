@@ -37,7 +37,7 @@ The decision logic utilizes a "Conditional Router" that evaluates the completion
 To address the hallucination of non-existent Blender API calls, a RAG system was developed.
 
 #### 1.4.1 Knowledge Base Construction
-The knowledge base was constructed by parsing the official Blender 4.5 Python API reference. These documents were chunked and embedded using the `Xenova/all-MiniLM-L6-v2` model (384 dimensions).
+The knowledge base was constructed by parsing the official Blender 4.5 Python API reference. These documents were chunked and embedded using the `Xenova/all-MiniLM-L6-v2` model (380 dimensions).
 
 #### 1.4.2 Vector Search Mechanism
 A PostgreSQL database with the `pgvector` extension serves as the vector store. When a query is received, the system computes the cosine similarity between the query embedding and stored document embeddings.
@@ -47,7 +47,7 @@ A PostgreSQL database with the `pgvector` extension serves as the vector store. 
 | Parameter | Value | Description |
 | :--- | :--- | :--- |
 | Embedding Model | all-MiniLM-L6-v2 | Optimized for semantic search |
-| Vector Dimensions | 384 | Dimensionality of the embedding space |
+| Vector Dimensions | 380 | Dimensionality of the embedding space |
 | Similarity Threshold | 0.2 | Minimum score for relevance |
 | Limit | 5 | Maximum documents retrieved per query |
 
