@@ -10,6 +10,37 @@ The system is built upon a client-server architecture, comprising a React-based 
 
 *Figure 1.1: High-level System Architecture Diagram showing the flow from User Input -> LangGraph Agent -> Blender TCP Server.*
 
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Electron + React Frontend                 │
+│  (Chat UI, Attachment Handling, Progress Tracking)          │
+└───────────────────────────┬─────────────────────────────────┘
+                            │ HTTP/REST
+┌───────────────────────────▼─────────────────────────────────┐
+│                    Node.js Express Backend                   │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │          LangGraph ReAct Agent Engine                │  │
+│  │  • Task Decomposition  • Parallel Execution          │  │
+│  │  • Dynamic Replanning  • Tool Orchestration          │  │
+│  └──────────────┬───────────────────────────────────────┘  │
+│                 │                                            │
+│  ┌──────────────▼───────────────────────────────────────┐  │
+│  │      RAG System (pgvector + Embeddings)              │  │
+│  │  • Blender API Docs  • Semantic Search               │  │
+│  └──────────────┬───────────────────────────────────────┘  │
+│                 │                                            │
+│  ┌──────────────▼───────────────────────────────────────┐  │
+│  │    Integration Layer (Circuit Breakers)              │  │
+│  │  • Hyper3D • Sketchfab • PolyHaven • Vision API     │  │
+│  └──────────────┬───────────────────────────────────────┘  │
+└─────────────────┼────────────────────────────────────────┘
+                  │ TCP Socket (Port 9876)
+┌─────────────────▼────────────────────────────────────────┐
+│              Blender 4.5+ with MCP Addon                 │
+│  • Python Execution • Asset Import • Screenshot Capture  │
+└──────────────────────────────────────────────────────────┘
+```
+
 The architecture consists of three primary subsystems:
 1.  **The Reasoning Engine**: A LangGraph-based ReAct agent that plans and executes tasks.
 2.  **The Knowledge Retrieval System**: A RAG (Retrieval-Augmented Generation) pipeline using PostgreSQL and pgvector.
@@ -24,6 +55,36 @@ The agent is implemented as a state machine using `LangGraph`. The state is defi
 *   **Scene Context**: A JSON representation of the current objects and materials in Blender.
 *   **RAG Context**: Relevant API documentation retrieved for the current task.
 *   **Loop Count**: A safety mechanism to prevent infinite execution loops (capped at 10).
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  User Request / Prompt                      │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+┌───────────────────────────▼─────────────────────────────────┐
+│                 Task Decomposition Node                     │
+│  (Breaks complex prompt into atomic subtasks)               │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+┌───────────────────────────▼─────────────────────────────────┐
+│◄──────────────────  Agent Loop Node  ───────────────────────│
+│  │  • Analyze State & History                               │
+│  │  • Select Next Tool / Subtask                            │
+│  │  • Check for Replanning Needs                            │
+│  └──────────────┬───────────────────────────▲───────────────┘
+│                 │ (Tool Call)               │ (Observation)
+│  ┌──────────────▼───────────────────────────┴───────────────┐
+│  │                  Tool Execution Layer                    │
+│  │ ┌─────────────┐ ┌─────────────┐ ┌──────────────────┐     │
+│  │ │ Knowledge   │ │ Blender     │ │ Asset Integration│     │
+│  │ │ Base Search │ │ Code Exec   │ │ (Hyper3D/Poly)   │     │
+│  │ └─────────────┘ └─────────────┘ └──────────────────┘     │
+│  │ ┌─────────────┐ ┌─────────────┐ ┌──────────────────┐     │
+│  │ │ Vision      │ │ Animation   │ │ Scene Info       │     │
+│  │ │ Validation  │ │ Generator   │ │ Retrieval        │     │
+│  │ └─────────────┘ └─────────────┘ └──────────────────┘     │
+│  └──────────────────────────────────────────────────────────┘
+```
 
 #### 1.3.2 Tool Selection Strategy
 The agent is equipped with a specific set of tools:
@@ -42,6 +103,30 @@ The knowledge base was constructed by parsing the official Blender 4.5 Python AP
 #### 1.4.2 Vector Search Mechanism
 A PostgreSQL database with the `pgvector` extension serves as the vector store. When a query is received, the system computes the cosine similarity between the query embedding and stored document embeddings.
 
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Query / Error Context                    │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+┌───────────────────────────▼─────────────────────────────────┐
+│               Local Embedding Generation                    │
+│       (Xenova/all-MiniLM-L6-v2 • 380 Dimensions)            │
+└───────────────────────────┬─────────────────────────────────┘
+                            │ Vector
+┌───────────────────────────▼─────────────────────────────────┐
+│               PostgreSQL + pgvector Database                │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ Table: blender_knowledge_new                         │   │
+│  │ • API Docs Chunks  • Vector Embeddings               │   │
+│  └──────────────────────────────────────────────────────┘   │
+└───────────────────────────┬─────────────────────────────────┘
+                            │ Semantic Matches
+┌───────────────────────────▼─────────────────────────────────┐
+│                  Context Augmentation                       │
+│  (Injects relevant API docs into LLM System Prompt)         │
+└──────────────────────────────────────────────────────────┘
+```
+
 *Table 1.1: RAG Retrieval Configuration*
 
 | Parameter | Value | Description |
@@ -58,6 +143,26 @@ A critical component of the investigation was establishing a reliable communicat
 
 #### 2.1.1 Communication Protocol
 A custom TCP server runs within Blender (via an addon), listening on port 9876. The Node.js backend acts as a client. The protocol enforces a strict sequential queue to prevent race conditions where multiple commands might corrupt the Blender context.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  Backend Integration Layer                  │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │                 Intent Detection                     │   │
+│  │  (Keywords: "realistic", "texture", "sketchfab")     │   │
+│  └──────────────┬───────────────────────────────────────┘   │
+│                 │                                           │
+│  ┌──────────────▼──────────────┐  ┌──────────────────────┐  │
+│  │    Circuit Breaker Guard    │  │    Command Queue     │  │
+│  │ (Fail > 3x = Open 30s)      │  │ (Sequential Proc.)   │  │
+│  └──────────────┬──────────────┘  └───────────┬──────────┘  │
+└─────────────────┼─────────────────────────────┼─────────────┘
+                  │ API Req                     │ TCP JSON
+┌─────────────────▼──────────────┐  ┌───────────▼─────────────┐
+│      External Asset APIs       │  │    Blender TCP Server   │
+│ (Hyper3D / Sketchfab / Poly)   │  │      (Port 9876)        │
+└────────────────────────────────┘  └─────────────────────────┘
+```
 
 #### 2.1.2 Command Execution and Sanitization
 Before any code is transmitted to Blender, it undergoes a sanitization process:
